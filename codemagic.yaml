@@ -1,0 +1,56 @@
+workflows:
+  ios-unsigned-sideloadly:
+    name: SH Lamp iOS - unsigned IPA for Sideloadly
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      vars:
+        XCODE_PROJECT: iosApp/SHLAMP.xcodeproj
+        XCODE_SCHEME: SHLAMP
+    scripts:
+      - name: Inspect Xcode project
+        script: |
+          set -euo pipefail
+          xcodebuild -list -project "$XCODE_PROJECT"
+
+      - name: Build unsigned iPhone app
+        script: |
+          set -euo pipefail
+          rm -rf "$CM_BUILD_DIR/build"
+          mkdir -p "$CM_BUILD_DIR/build"
+
+          xcodebuild build \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$CM_BUILD_DIR/build/DerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package unsigned IPA
+        script: |
+          set -euo pipefail
+          APP_PATH="$(find "$CM_BUILD_DIR/build/DerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' -print -quit)"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "No Release-iphoneos .app was produced."
+            exit 1
+          fi
+
+          rm -rf "$CM_BUILD_DIR/build/Payload"
+          mkdir -p "$CM_BUILD_DIR/build/Payload"
+          cp -R "$APP_PATH" "$CM_BUILD_DIR/build/Payload/"
+
+          cd "$CM_BUILD_DIR/build"
+          /usr/bin/zip -qry SHLAMP-unsigned.ipa Payload
+          /usr/bin/zip -T SHLAMP-unsigned.ipa
+          /usr/bin/shasum -a 256 SHLAMP-unsigned.ipa > SHLAMP-unsigned.ipa.sha256
+
+    artifacts:
+      - build/SHLAMP-unsigned.ipa
+      - build/SHLAMP-unsigned.ipa.sha256
+      - build/DerivedData/Build/Products/Release-iphoneos/*.app
+      - build/DerivedData/Build/Products/Release-iphoneos/*.dSYM
