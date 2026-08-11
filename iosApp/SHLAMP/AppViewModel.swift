@@ -1116,7 +1116,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func selectedRoute(for lamp: LampRecord, local: LampRecord?, cloud: LampRecord?) -> LampConnectionRoute {
-        let hasWiFi = local.map(isWiFiHealthy) ?? false
+        let hasWiFi = local.map { isWiFiHealthy($0) } ?? false
         let hasBLE = local.map(canUseBLE) ?? false
         let linkedCloud = lamp.cloudLampId.flatMap { cloudID in
             dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })

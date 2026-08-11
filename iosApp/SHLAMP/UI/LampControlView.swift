@@ -297,7 +297,7 @@ struct LampControlView: View {
 
     private func controlMetrics(_ lamp: LampRecord) -> some View {
         let timerRemaining = model.remainingTimerSeconds(for: lamp)
-        HStack(spacing: 10) {
+        return HStack(spacing: 10) {
             ControlMetric(
                 title: "Brightness",
                 value: "\(Int(draftBrightness))%",
@@ -442,7 +442,7 @@ struct LampControlView: View {
 
     private func fadeAndTimerCard(_ lamp: LampRecord) -> some View {
         let timerRemaining = model.remainingTimerSeconds(for: lamp)
-        VStack(alignment: .leading, spacing: 16) {
+        return VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Fade speed").font(.headline)
                 Text("How quickly brightness changes")
