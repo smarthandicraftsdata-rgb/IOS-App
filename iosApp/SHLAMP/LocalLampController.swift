@@ -3,6 +3,7 @@ import Foundation
 @MainActor
 protocol LocalLampControllerDelegate: AnyObject {
     func localController(_ controller: LocalLampController, didDiscover snapshot: WiFiLampSnapshot)
+    func localController(_ controller: LocalLampController, didReceiveRealtime snapshot: WiFiLampSnapshot)
     func localController(_ controller: LocalLampController, didChangeStatus status: String)
 }
 
@@ -14,6 +15,15 @@ final class LocalLampController: NSObject {
     private var discoveredHosts: Set<String> = []
     private let session: URLSession
     private var discoveryRunning = false
+
+    // R21A additive realtime transport. HTTP remains the fallback for old
+    // firmware and for any WebSocket interruption.
+    private let realtimeLock = NSLock()
+    private var realtimeTasks: [String: URLSessionWebSocketTask] = [:]
+    private var realtimeLastMessageAt: [String: Date] = [:]
+    private var realtimeValidatedHosts: Set<String> = []
+    private var realtimeHeartbeatTasks: [String: Task<Void, Never>] = [:]
+    private var realtimeReconnectTasks: [String: Task<Void, Never>] = [:]
 
     override init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -38,7 +48,222 @@ final class LocalLampController: NSObject {
         browser.stop()
         resolving.values.forEach { $0.stop() }
         resolving.removeAll()
+        stopAllRealtime()
     }
+
+    // MARK: - R21A local realtime
+
+    func startRealtime(host: String) {
+        let clean = normalizedHost(host)
+        guard !clean.isEmpty else { return }
+
+        realtimeLock.lock()
+        let pendingReconnect = realtimeReconnectTasks.removeValue(forKey: clean)
+        let existing = realtimeTasks[clean]
+        realtimeLock.unlock()
+        pendingReconnect?.cancel()
+        if existing != nil { return }
+
+        guard let url = realtimeURL(host: clean) else { return }
+        let socket = session.webSocketTask(with: url)
+
+        realtimeLock.lock()
+        // Another caller may have won while the URL was being built.
+        if realtimeTasks[clean] != nil {
+            realtimeLock.unlock()
+            socket.cancel(with: .goingAway, reason: nil)
+            return
+        }
+        realtimeTasks[clean] = socket
+        realtimeLock.unlock()
+
+        socket.resume()
+        receiveRealtime(host: clean, socket: socket)
+        sendRealtimeHello(host: clean, socket: socket)
+        startRealtimeHeartbeat(host: clean, socket: socket)
+    }
+
+    func stopRealtime(host: String) {
+        let clean = normalizedHost(host)
+        realtimeLock.lock()
+        let socket = realtimeTasks.removeValue(forKey: clean)
+        realtimeLastMessageAt.removeValue(forKey: clean)
+        realtimeValidatedHosts.remove(clean)
+        let heartbeat = realtimeHeartbeatTasks.removeValue(forKey: clean)
+        let reconnect = realtimeReconnectTasks.removeValue(forKey: clean)
+        realtimeLock.unlock()
+        heartbeat?.cancel()
+        reconnect?.cancel()
+        socket?.cancel(with: .goingAway, reason: nil)
+    }
+
+    func isRealtimeHealthy(host: String, now: Date = Date()) -> Bool {
+        let clean = normalizedHost(host)
+        realtimeLock.lock()
+        let last = realtimeLastMessageAt[clean]
+        let hasTask = realtimeTasks[clean] != nil
+        let validated = realtimeValidatedHosts.contains(clean)
+        realtimeLock.unlock()
+        guard hasTask, validated, let last else { return false }
+        return now.timeIntervalSince(last) <= 16
+    }
+
+    // R21A Review Fix 1 intentionally keeps this socket state/event-only.
+    // Local commands continue through the proven HTTP API until a later phase
+    // adds explicit WebSocket command ACK correlation and idempotent retry.
+
+    private func receiveRealtime(host: String, socket: URLSessionWebSocketTask) {
+        socket.receive { [weak self, weak socket] result in
+            guard let self, let socket else { return }
+
+            self.realtimeLock.lock()
+            let stillCurrent = self.realtimeTasks[host] === socket
+            self.realtimeLock.unlock()
+            guard stillCurrent else { return }
+
+            switch result {
+            case .failure:
+                self.markRealtimeDisconnected(host: host, socket: socket)
+            case .success(let message):
+                let data: Data?
+                switch message {
+                case .string(let text): data = text.data(using: .utf8)
+                case .data(let value): data = value
+                @unknown default: data = nil
+                }
+
+                if let data, let object = try? parseJSONObject(data) {
+                    self.realtimeLock.lock()
+                    self.realtimeLastMessageAt[host] = Date()
+                    self.realtimeLock.unlock()
+                    self.handleRealtimeObject(object, host: host)
+                }
+                self.receiveRealtime(host: host, socket: socket)
+            }
+        }
+    }
+
+    private func handleRealtimeObject(_ object: JSONObject, host: String) {
+        let type = object.string("type")
+        var stateObject: JSONObject?
+        if type.caseInsensitiveCompare("state") == .orderedSame {
+            stateObject = object
+        } else if type.caseInsensitiveCompare("ack") == .orderedSame {
+            stateObject = object.object("state")
+        }
+
+        guard let stateObject, let snapshot = try? snapshot(from: stateObject, host: host) else { return }
+        realtimeLock.lock()
+        realtimeValidatedHosts.insert(host)
+        realtimeLastMessageAt[host] = Date()
+        realtimeLock.unlock()
+        Task { @MainActor in
+            delegate?.localController(self, didReceiveRealtime: snapshot)
+        }
+    }
+
+    private func sendRealtimeHello(host: String, socket: URLSessionWebSocketTask) {
+        let object: JSONObject = ["type": "hello", "protocolVersion": 2]
+        guard let data = try? jsonData(object), let text = String(data: data, encoding: .utf8) else { return }
+        socket.send(.string(text)) { _ in }
+    }
+
+    // Keep NSLock operations inside synchronous helpers. Async Tasks call
+    // these helpers only before/after suspension points; no lock is held
+    // across an await and we avoid raw lock()/unlock() inside async contexts.
+    private func isCurrentRealtimeSocket(host: String, socket: URLSessionWebSocketTask) -> Bool {
+        realtimeLock.lock()
+        defer { realtimeLock.unlock() }
+        return realtimeTasks[host] === socket
+    }
+
+    private func recordRealtimeActivityIfCurrent(host: String, socket: URLSessionWebSocketTask) {
+        realtimeLock.lock()
+        defer { realtimeLock.unlock() }
+        guard realtimeTasks[host] === socket else { return }
+        realtimeLastMessageAt[host] = Date()
+    }
+
+    private func startRealtimeHeartbeat(host: String, socket: URLSessionWebSocketTask) {
+        realtimeLock.lock()
+        realtimeHeartbeatTasks[host]?.cancel()
+        let task = Task { [weak self, weak socket] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(10))
+                guard let self, let socket else { return }
+                guard self.isCurrentRealtimeSocket(host: host, socket: socket) else { return }
+
+                socket.sendPing { [weak self, weak socket] error in
+                    guard let self, let socket else { return }
+                    if error == nil {
+                        self.recordRealtimeActivityIfCurrent(host: host, socket: socket)
+                    } else {
+                        self.markRealtimeDisconnected(host: host, socket: socket)
+                    }
+                }
+            }
+        }
+        realtimeHeartbeatTasks[host] = task
+        realtimeLock.unlock()
+    }
+
+    private func markRealtimeDisconnected(host: String, socket: URLSessionWebSocketTask) {
+        realtimeLock.lock()
+        guard realtimeTasks[host] === socket else {
+            realtimeLock.unlock()
+            return
+        }
+        realtimeTasks.removeValue(forKey: host)
+        realtimeLastMessageAt.removeValue(forKey: host)
+        realtimeValidatedHosts.remove(host)
+        let heartbeat = realtimeHeartbeatTasks.removeValue(forKey: host)
+        realtimeLock.unlock()
+        heartbeat?.cancel()
+        socket.cancel(with: .goingAway, reason: nil)
+
+        // HTTP polling remains active as fallback. Reconnect is deliberately
+        // modest so a dead/old firmware endpoint cannot create a tight loop.
+        // Track the task so Wi-Fi loss/sign-out can cancel it cleanly.
+        let reconnect = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, let self else { return }
+            self.startRealtime(host: host)
+        }
+        realtimeLock.lock()
+        realtimeReconnectTasks[host]?.cancel()
+        realtimeReconnectTasks[host] = reconnect
+        realtimeLock.unlock()
+    }
+
+    private func stopAllRealtime() {
+        realtimeLock.lock()
+        let sockets = Array(realtimeTasks.values)
+        let heartbeats = Array(realtimeHeartbeatTasks.values)
+        let reconnects = Array(realtimeReconnectTasks.values)
+        realtimeTasks.removeAll()
+        realtimeLastMessageAt.removeAll()
+        realtimeValidatedHosts.removeAll()
+        realtimeHeartbeatTasks.removeAll()
+        realtimeReconnectTasks.removeAll()
+        realtimeLock.unlock()
+        heartbeats.forEach { $0.cancel() }
+        reconnects.forEach { $0.cancel() }
+        sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
+    }
+
+    private func realtimeURL(host: String) -> URL? {
+        let clean = normalizedHost(host)
+        guard !clean.isEmpty else { return nil }
+        let baseHost: String
+        if let colon = clean.lastIndex(of: ":"), clean[clean.index(after: colon)...].allSatisfy({ $0.isNumber }) {
+            baseHost = String(clean[..<colon])
+        } else {
+            baseHost = clean
+        }
+        return URL(string: "ws://\(baseHost):81/")
+    }
+
+    // MARK: - Proven HTTP fallback/API
 
     func readStatus(host: String) async throws -> WiFiLampSnapshot {
         try snapshot(from: try await request(host: host, path: "/api/status"), host: normalizedHost(host))
@@ -56,9 +281,6 @@ final class LocalLampController: NSObject {
         }
     }
 
-    /// Low-latency slider transport. Intermediate drag values intentionally do
-    /// not run the multi-read verification loop; the final value still uses
-    /// `sendBrightness` and is verified by the lamp.
     func sendBrightnessFast(host: String, percent: Int) async throws {
         let value = clamp(percent, 0...100)
         _ = try await request(host: host, path: "/api/brightness?value=\(value)")
@@ -125,7 +347,7 @@ final class LocalLampController: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.6.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.1", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? ""
@@ -135,7 +357,10 @@ final class LocalLampController: NSObject {
     }
 
     private func snapshot(from data: Data, host: String) throws -> WiFiLampSnapshot {
-        let json = try parseJSONObject(data)
+        try snapshot(from: parseJSONObject(data), host: host)
+    }
+
+    private func snapshot(from json: JSONObject, host: String) throws -> WiFiLampSnapshot {
         let lampID = json.string("lampId").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !lampID.isEmpty else { throw AppError.message("The lamp firmware did not return lampId.") }
         let cloudID = [json.string("cloudLampId"), json.string("cloudId"), json.string("renderLampId")]
@@ -143,7 +368,7 @@ final class LocalLampController: NSObject {
             .first { $0.range(of: "^SH-[A-Z0-9]{4,16}$", options: .regularExpression) != nil }
         let batteryPercent = json.int("batteryPercent").map { clamp($0, 0...100) }
         let batteryVoltage = json.int("batteryVoltageMv").flatMap { (2000...5000).contains($0) ? $0 : nil }
-        return WiFiLampSnapshot(
+        var snapshot = WiFiLampSnapshot(
             lampId: lampID.uppercased(),
             cloudLampId: cloudID,
             lampName: firstNonBlank(json.string("lampName"), lampID),
@@ -170,6 +395,10 @@ final class LocalLampController: NSObject {
             runtimeState: LampRuntimeState(rawValue: json.string("runtimeState").uppercased()) ?? .unknown,
             host: host
         )
+        snapshot.stateBootId = json.int("bootId", "stateBootId").map { Int64($0) }
+        snapshot.stateBootSequence = json.int("bootSequence", "stateBootSequence").map { Int64($0) }
+        snapshot.stateRevision = json.int("stateRevision", "revision").map { Int64($0) }
+        return snapshot
     }
 
     private func normalizedHost(_ raw: String) -> String {
@@ -212,6 +441,7 @@ extension LocalLampController: NetServiceBrowserDelegate, NetServiceDelegate {
         guard let hostName = sender.hostName else { return }
         let host = sender.port == 80 ? hostName : "\(hostName):\(sender.port)"
         guard discoveredHosts.insert(host).inserted else { return }
+        startRealtime(host: host)
         Task {
             if let snapshot = try? await readStatus(host: host) {
                 await MainActor.run { delegate?.localController(self, didDiscover: snapshot) }

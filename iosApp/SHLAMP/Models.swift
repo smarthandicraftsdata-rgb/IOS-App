@@ -113,11 +113,16 @@ struct LampState: Codable, Equatable {
     var batteryCharging: Bool?
     var powerMode: LampPowerMode = .balanced
     var runtimeState: LampRuntimeState = .unknown
+    // R21A optional authoritative ordering metadata. Older firmware/cloud
+    // responses omit these fields and continue to use receipt-time freshness.
+    var stateBootId: Int64? = nil
+    var stateBootSequence: Int64? = nil
+    var stateRevision: Int64? = nil
 
     private enum CodingKeys: String, CodingKey {
         case power, brightness, fadeMode, timerRemainingSeconds
         case batteryValid, batteryPercent, batteryVoltageMv, batteryCharging
-        case powerMode, runtimeState
+        case powerMode, runtimeState, stateBootId, stateBootSequence, stateRevision
     }
 
     init(
@@ -130,7 +135,10 @@ struct LampState: Codable, Equatable {
         batteryVoltageMv: Int? = nil,
         batteryCharging: Bool? = nil,
         powerMode: LampPowerMode = .balanced,
-        runtimeState: LampRuntimeState = .unknown
+        runtimeState: LampRuntimeState = .unknown,
+        stateBootId: Int64? = nil,
+        stateBootSequence: Int64? = nil,
+        stateRevision: Int64? = nil
     ) {
         self.power = power
         self.brightness = brightness
@@ -142,6 +150,9 @@ struct LampState: Codable, Equatable {
         self.batteryCharging = batteryCharging
         self.powerMode = powerMode
         self.runtimeState = runtimeState
+        self.stateBootId = stateBootId
+        self.stateBootSequence = stateBootSequence
+        self.stateRevision = stateRevision
     }
 
     init(from decoder: Decoder) throws {
@@ -156,6 +167,9 @@ struct LampState: Codable, Equatable {
         batteryCharging = try values.decodeIfPresent(Bool.self, forKey: .batteryCharging)
         powerMode = try values.decodeIfPresent(LampPowerMode.self, forKey: .powerMode) ?? .balanced
         runtimeState = try values.decodeIfPresent(LampRuntimeState.self, forKey: .runtimeState) ?? .unknown
+        stateBootId = try values.decodeIfPresent(Int64.self, forKey: .stateBootId)
+        stateBootSequence = try values.decodeIfPresent(Int64.self, forKey: .stateBootSequence)
+        stateRevision = try values.decodeIfPresent(Int64.self, forKey: .stateRevision)
     }
 }
 
@@ -342,6 +356,9 @@ struct WiFiLampSnapshot: Equatable {
     let powerMode: LampPowerMode
     let runtimeState: LampRuntimeState
     let host: String
+    var stateBootId: Int64? = nil
+    var stateBootSequence: Int64? = nil
+    var stateRevision: Int64? = nil
 }
 
 struct LampQRPayload: Equatable {

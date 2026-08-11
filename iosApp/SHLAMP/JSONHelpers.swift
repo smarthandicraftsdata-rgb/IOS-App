@@ -37,7 +37,7 @@ extension Dictionary where Key == String, Value == Any {
     }
 
     func int64(_ keys: String...) -> Int64? {
-        int(keys.first ?? "").map(Int64.init)
+        int(keys.first ?? "").map { Int64($0) }
     }
 
     func bool(_ keys: String...) -> Bool? {

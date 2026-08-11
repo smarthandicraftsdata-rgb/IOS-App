@@ -195,6 +195,9 @@ final class AppViewModel: ObservableObject {
 
     func startConnections() {
         local.startDiscovery()
+        for host in Set(localRecords.values.compactMap(\.localHost)) {
+            local.startRealtime(host: host)
+        }
         if !manualAddFlowActive { ble.startScan() }
         if let token = session?.accessToken {
             realtime.start(token: token, homeID: dashboard.homes.first?.id ?? "default")
@@ -646,7 +649,12 @@ final class AppViewModel: ObservableObject {
         for route in order {
             switch route {
             case .wifi:
-                guard isWiFiHealthy(lamp), let host = lamp.localHost, let localAction else { continue }
+                guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
+
+                // R21A Review Fix 1: Local WebSocket is event/state-only.
+                // Keep the already-proven HTTP command + verification path
+                // until a later protocol phase adds explicit LAN ACK tracking.
+                guard let localAction else { continue }
                 do {
                     let requestStartedAt = Date()
                     apply(snapshot: try await localAction(host), observedAt: requestStartedAt, authoritative: true)
@@ -683,12 +691,42 @@ final class AppViewModel: ObservableObject {
         case .remote:
             return [.cloud]
         case .bluetooth:
-            return [.bluetooth, .cloud, .wifi]
+            return [.bluetooth, .wifi, .cloud]
         case .wifi:
             return [.wifi, .bluetooth, .cloud]
         case .automatic:
-            return [.wifi, .bluetooth, .cloud]
+            let preferred = automaticLocalRoute(for: lamp)
+            switch preferred {
+            case .bluetooth: return [.bluetooth, .wifi, .cloud]
+            case .wifi: return [.wifi, .bluetooth, .cloud]
+            case .cloud: return [.cloud, .bluetooth, .wifi]
+            case .offline: return [.bluetooth, .wifi, .cloud]
+            }
         }
+    }
+
+    /// BLE is preferred while it is genuinely healthy. Hysteresis prevents a
+    /// lamp near the range boundary from bouncing BLE <-> LAN every few RSSI
+    /// samples. Unknown RSSI immediately after connection still prefers BLE.
+    private func automaticLocalRoute(for lamp: LampRecord) -> LampConnectionRoute {
+        let hasBLE = canUseBLE(lamp)
+        let hasWiFi = isWiFiHealthy(lamp)
+        guard hasBLE || hasWiFi else {
+            return cloudConnected ? .cloud : .offline
+        }
+        guard hasBLE else { return .wifi }
+        guard hasWiFi else { return .bluetooth }
+
+        let rssi = lamp.bleRSSI
+        if rssi <= -120 { return .bluetooth } // waiting for first RSSI read
+
+        if lamp.route == .bluetooth {
+            return rssi <= -82 ? .wifi : .bluetooth
+        }
+        if lamp.route == .wifi {
+            return rssi >= -70 ? .bluetooth : .wifi
+        }
+        return rssi >= -78 ? .bluetooth : .wifi
     }
 
     private func markWiFiFailure(for lamp: LampRecord) {
@@ -740,6 +778,7 @@ final class AppViewModel: ObservableObject {
                     for record in records {
                         guard let host = record.localHost else { continue }
                         let key = record.id.uppercased()
+                        if self.local.isRealtimeHealthy(host: host) { continue }
                         guard !self.localPollInFlight.contains(key) else { continue }
                         self.localPollInFlight.insert(key)
                         Task { @MainActor [weak self] in
@@ -777,7 +816,8 @@ final class AppViewModel: ObservableObject {
     }
 
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
-        guard wifiPathAvailable, lamp.localHost != nil else { return false }
+        guard wifiPathAvailable, let host = lamp.localHost else { return false }
+        if local.isRealtimeHealthy(host: host, now: now) { return true }
         let keys = [lamp.id.uppercased(), lamp.cloudLampId?.uppercased()].compactMap { $0 }
         guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else { return false }
         return now.timeIntervalSince(last) <= wifiHealthTTL
@@ -903,6 +943,11 @@ final class AppViewModel: ObservableObject {
                 self.wifiPathAvailable = hasWiFi
                 guard changed else { return }
                 if hasWiFi {
+                    // Re-open remembered realtime sockets immediately instead
+                    // of waiting for Bonjour rediscovery after Wi-Fi returns.
+                    for host in Set(self.localRecords.values.compactMap(\.localHost)) {
+                        self.local.startRealtime(host: host)
+                    }
                     self.local.startDiscovery()
                 } else {
                     self.local.stopDiscovery()
@@ -928,6 +973,12 @@ final class AppViewModel: ObservableObject {
             var restored = record
             restored.route = .offline
             restored.online = false
+            // Ordering tokens are live-session evidence, not user preferences.
+            // Relearn them from the ESP/cloud after launch so a stale persisted
+            // boot sequence can never block a freshly reset/reflashed lamp.
+            restored.state.stateBootId = nil
+            restored.state.stateBootSequence = nil
+            restored.state.stateRevision = nil
             // Account ownership is session-scoped and must be proven again by
             // the signed-in user's cloud dashboard. Keep the reported cloud ID,
             // but never trust a persisted Boolean from another account/session.
@@ -1092,17 +1143,16 @@ final class AppViewModel: ObservableObject {
         let receivedAt = Date()
         let stateObservedAt = authoritative ? receivedAt : observedAt
         localSnapshots[localID] = snapshot
+        local.startRealtime(host: snapshot.host)
         wifiConfirmedAt[localID] = receivedAt
         localStateReceivedAt[localID] = stateObservedAt
         localFailureCounts[localID] = 0
-        if authoritative { optimisticStateAt.removeValue(forKey: localID) }
 
         let cloudID = snapshot.cloudLampId?.uppercased()
         if let cloudID {
             wifiConfirmedAt[cloudID] = receivedAt
             localStateReceivedAt[cloudID] = stateObservedAt
             localFailureCounts[cloudID] = 0
-            if authoritative { optimisticStateAt.removeValue(forKey: cloudID) }
         }
         let existingKey = localRecords.keys.first { key in
             key == localID ||
@@ -1126,29 +1176,47 @@ final class AppViewModel: ObservableObject {
         record.bleName = snapshot.bleName.isEmpty ? record.bleName : snapshot.bleName
         record.controllerCount = snapshot.controllerCount
         let currentState = lamps.first(where: { $0.canonicalID == record.canonicalID })?.state ?? record.state
-        let timerAccepted = registerTimerState(
-            for: record,
-            remainingSeconds: snapshot.timerRemainingSeconds,
-            receivedAt: receivedAt
-        )
-        let incomingState = LampState(
+        var incomingState = LampState(
             power: snapshot.power,
             brightness: snapshot.targetBrightness,
             fadeMode: snapshot.fadeMode,
-            timerRemainingSeconds: timerAccepted ? snapshot.timerRemainingSeconds : currentState.timerRemainingSeconds,
+            timerRemainingSeconds: snapshot.timerRemainingSeconds,
             batteryValid: snapshot.batteryValid,
             batteryPercent: snapshot.batteryPercent,
             batteryVoltageMv: snapshot.batteryVoltageMv,
             batteryCharging: snapshot.batteryCharging,
             powerMode: snapshot.powerMode,
-            runtimeState: snapshot.runtimeState
+            runtimeState: snapshot.runtimeState,
+            stateBootId: snapshot.stateBootId,
+            stateBootSequence: snapshot.stateBootSequence,
+            stateRevision: snapshot.stateRevision
         )
-        record.state = protectedIncomingState(incomingState, for: record, current: currentState)
-        if timerAccepted {
+        let stateAccepted = shouldAcceptAuthoritativeState(
+            incomingState,
+            current: currentState
+        )
+        var timerAccepted = false
+        if stateAccepted {
+            timerAccepted = registerTimerState(
+                for: record,
+                remainingSeconds: snapshot.timerRemainingSeconds,
+                receivedAt: receivedAt
+            )
+            if !timerAccepted { incomingState.timerRemainingSeconds = currentState.timerRemainingSeconds }
+            record.state = protectedIncomingState(incomingState, for: record, current: currentState)
+            if authoritative {
+                optimisticStateAt.removeValue(forKey: localID)
+                if let cloudID { optimisticStateAt.removeValue(forKey: cloudID) }
+            }
+        } else {
+            record.state = currentState
+        }
+        if stateAccepted && timerAccepted {
             scheduleTimerNotification(for: record, remainingSeconds: snapshot.timerRemainingSeconds)
         }
-        let bluetoothPreferred = record.routePreference == .bluetooth && canUseBLE(record)
-        record.route = bluetoothPreferred ? .bluetooth : .wifi
+        record.route = selectedRoute(for: record, local: record, cloud: record.cloudLampId.flatMap { cloudID in
+            dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+        })
         if key != localID { localRecords.removeValue(forKey: key) }
         localRecords[localID] = record
         let metadataChanged = key != localID ||
@@ -1248,13 +1316,31 @@ final class AppViewModel: ObservableObject {
             localClearsOptimisticHold = optimisticAt == nil
         }
 
-        if let localFullStateAt,
-           localClearsOptimisticHold,
-           primaryFreshness == nil || localFullStateAt >= primaryFreshness! {
-            // Route health decides where the next command is sent; it must not
-            // erase a newer confirmed state just because that transport has
-            // temporarily fallen back. This prevents Local Wi-Fi -> Remote
-            // transitions from making brightness/timer jump backward.
+        let localAndPrimaryHaveVersions =
+            local.state.stateBootSequence != nil && local.state.stateRevision != nil &&
+            merged.state.stateBootSequence != nil && merged.state.stateRevision != nil
+        let sameAuthoritativeVersion = localAndPrimaryHaveVersions &&
+            local.state.stateBootSequence == merged.state.stateBootSequence &&
+            local.state.stateRevision == merged.state.stateRevision &&
+            (local.state.stateBootId == nil || merged.state.stateBootId == nil ||
+                local.state.stateBootId == merged.state.stateBootId)
+
+        if localAndPrimaryHaveVersions && !sameAuthoritativeVersion {
+            // Version ordering wins over transport receipt time. Lower boot
+            // sequences are rejected in-session so a delayed older incarnation
+            // cannot overwrite a newer authoritative state.
+            if shouldAcceptAuthoritativeState(
+                local.state,
+                current: merged.state
+            ) {
+                merged.state = local.state
+            }
+        } else if let localFullStateAt,
+                  localClearsOptimisticHold,
+                  primaryFreshness == nil || localFullStateAt >= primaryFreshness! {
+            // For equal revisions (the timer countdown can change without a
+            // logical revision) or legacy firmware, receipt freshness remains
+            // the tie-breaker. Route choice itself never decides state age.
             merged.state = local.state
         }
 
@@ -1286,21 +1372,32 @@ final class AppViewModel: ObservableObject {
             return hasCloud ? .cloud : .offline
         case .bluetooth:
             if hasBLE { return .bluetooth }
-            if hasCloud { return .cloud }
+            // A manual Bluetooth preference still falls back locally before
+            // going remote, matching routeOrder() and the user's expected
+            // BLE -> LAN -> Cloud behavior.
             if hasWiFi { return .wifi }
+            if hasCloud { return .cloud }
         case .wifi:
             if hasWiFi { return .wifi }
             if hasBLE { return .bluetooth }
             if hasCloud { return .cloud }
         case .automatic:
-            if hasWiFi { return .wifi }
+            if let local {
+                let preferred = automaticLocalRoute(for: local)
+                if preferred == .bluetooth && hasBLE { return .bluetooth }
+                if preferred == .wifi && hasWiFi { return .wifi }
+            }
             if hasBLE { return .bluetooth }
+            if hasWiFi { return .wifi }
             if hasCloud { return .cloud }
         }
         return .offline
     }
 
-    private func applyCloudLamp(_ incoming: LampRecord, receivedAt: Date) {
+    private func applyCloudLamp(
+        _ incoming: LampRecord,
+        receivedAt: Date
+    ) {
         var lamp = incoming
         let id = lamp.id.uppercased()
         lamp.id = id
@@ -1323,16 +1420,56 @@ final class AppViewModel: ObservableObject {
             ?? existingDashboard?.state
             ?? lamp.state
         let reportedTimer = lamp.state.timerRemainingSeconds
-        let timerAccepted = registerTimerState(for: lamp, remainingSeconds: reportedTimer, receivedAt: receivedAt)
-        if !timerAccepted { lamp.state.timerRemainingSeconds = currentState.timerRemainingSeconds }
-        lamp.state = protectedIncomingState(lamp.state, for: lamp, current: currentState)
+        let stateAccepted = shouldAcceptAuthoritativeState(
+            lamp.state,
+            current: currentState
+        )
+        var timerAccepted = false
+        if stateAccepted {
+            timerAccepted = registerTimerState(for: lamp, remainingSeconds: reportedTimer, receivedAt: receivedAt)
+            if !timerAccepted { lamp.state.timerRemainingSeconds = currentState.timerRemainingSeconds }
+            lamp.state = protectedIncomingState(lamp.state, for: lamp, current: currentState)
+            optimisticStateAt.removeValue(forKey: id)
+        } else {
+            lamp.state = currentState
+        }
 
         cloudStateReceivedAt[id] = receivedAt
-        optimisticStateAt.removeValue(forKey: id)
-        if timerAccepted { scheduleTimerNotification(for: lamp, remainingSeconds: reportedTimer) }
+        if stateAccepted && timerAccepted { scheduleTimerNotification(for: lamp, remainingSeconds: reportedTimer) }
         dashboard.lamps.removeAll { $0.id.caseInsensitiveCompare(id) == .orderedSame }
         dashboard.lamps.append(lamp)
         rebuildLamps()
+    }
+
+    /// R21A authoritative ordering. New firmware supplies a persistent boot
+    /// sequence plus a boot-local revision. Older firmware has no metadata and
+    /// keeps the proven receipt-time merge behavior.
+    private func shouldAcceptAuthoritativeState(
+        _ incoming: LampState,
+        current: LampState
+    ) -> Bool {
+        guard let incomingBoot = incoming.stateBootSequence,
+              let incomingRevision = incoming.stateRevision,
+              let currentBoot = current.stateBootSequence,
+              let currentRevision = current.stateRevision else {
+            return true
+        }
+
+        if incomingBoot > currentBoot { return true }
+        if incomingBoot < currentBoot { return false }
+
+        // Same persistent boot sequence: revisions are comparable only inside
+        // the same boot incarnation. A different nonce with the same sequence
+        // is ambiguous (for example an NVS erase/reset), so reject it in the
+        // current app session rather than risk accepting a delayed stale boot.
+        // The app intentionally clears persisted ordering metadata at launch,
+        // so a relaunch safely establishes the new incarnation.
+        if let incomingBootId = incoming.stateBootId,
+           let currentBootId = current.stateBootId,
+           incomingBootId != currentBootId {
+            return false
+        }
+        return incomingRevision >= currentRevision
     }
 
     private func handle(_ error: Error) {
@@ -1424,9 +1561,17 @@ extension AppViewModel: BLELampManagerDelegate {
         record.bleIdentifier = peripheralID
         record.bleName = name
         record.bleRSSI = nearbyLamps.first(where: { $0.id == peripheralID })?.rssi ?? record.bleRSSI
-        let keepWiFi = record.routePreference != .bluetooth && isWiFiHealthy(record)
-        record.route = keepWiFi ? .wifi : .bluetooth
-        record.online = true
+        // R21A: connection availability and command-route choice are separate.
+        // Re-evaluate through the same hysteresis-aware selector used everywhere
+        // else instead of forcing the older Wi-Fi-first behavior here.
+        record.route = selectedRoute(
+            for: record,
+            local: record,
+            cloud: record.cloudLampId.flatMap { cloudID in
+                dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+            }
+        )
+        record.online = record.route != .offline
         localRecords[localKey] = record
         persistLocalRecords()
         rebuildLamps()
@@ -1464,10 +1609,15 @@ extension AppViewModel: BLELampManagerDelegate {
             bleStateReceivedAt[cloudID] = receivedAt
             optimisticStateAt.removeValue(forKey: cloudID)
         }
-        let keepWiFi = record.routePreference != .bluetooth && isWiFiHealthy(record)
-        record.route = keepWiFi ? .wifi : .bluetooth
-        record.online = true
         record.bleRSSI = status.rssi
+        record.route = selectedRoute(
+            for: record,
+            local: record,
+            cloud: record.cloudLampId.flatMap { cloudID in
+                dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+            }
+        )
+        record.online = record.route != .offline
 
         let currentState = lamps.first(where: { $0.canonicalID == record.canonicalID })?.state ?? record.state
         let timerAccepted = registerTimerState(
@@ -1520,6 +1670,15 @@ extension AppViewModel: BLELampManagerDelegate {
         rebuildLamps()
     }
 
+    func bleManager(_ manager: BLELampManager, didUpdateRSSI rssi: Int, lampID: String) {
+        let key = (lampID.isEmpty ? connectedLocalID : lampID).uppercased()
+        guard !key.isEmpty else { return }
+        var record = localRecords[key] ?? .placeholder(id: key)
+        record.bleRSSI = rssi
+        localRecords[key] = record
+        rebuildLamps()
+    }
+
     func bleManager(_ manager: BLELampManager, bluetoothPoweredOn: Bool) {
         if bluetoothPoweredOn {
             probedPeripheralIDs.removeAll()
@@ -1552,6 +1711,9 @@ extension AppViewModel: BLELampManagerDelegate {
 
 extension AppViewModel: LocalLampControllerDelegate {
     func localController(_ controller: LocalLampController, didDiscover snapshot: WiFiLampSnapshot) { apply(snapshot: snapshot) }
+    func localController(_ controller: LocalLampController, didReceiveRealtime snapshot: WiFiLampSnapshot) {
+        apply(snapshot: snapshot, observedAt: Date(), authoritative: true)
+    }
     func localController(_ controller: LocalLampController, didChangeStatus status: String) { localNetworkStatus = status }
 }
 

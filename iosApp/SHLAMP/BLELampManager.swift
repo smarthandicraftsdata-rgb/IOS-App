@@ -12,6 +12,7 @@ protocol BLELampManagerDelegate: AnyObject {
     func bleManager(_ manager: BLELampManager, didReceiveBattery percent: Int, lampID: String)
     func bleManager(_ manager: BLELampManager, didReceiveWiFiStatus status: String)
     func bleManager(_ manager: BLELampManager, didReceivePowerMode mode: LampPowerMode)
+    func bleManager(_ manager: BLELampManager, didUpdateRSSI rssi: Int, lampID: String)
     func bleManager(_ manager: BLELampManager, bluetoothPoweredOn: Bool)
     func bleManager(_ manager: BLELampManager, didReceiveSavedNetworks networks: [SavedWiFiNetwork])
     func bleManager(_ manager: BLELampManager, didReceiveControllers controllers: [LampControllerAccess])
@@ -61,6 +62,7 @@ final class BLELampManager: NSObject {
     private var connectedLampID = ""
     private var connectedName = ""
     private var lastRSSI = -127
+    private var rssiTask: Task<Void, Never>?
     private var initialStateRequested = false
     private var connectionSetupCompleted = false
     private var scanStopWorkItem: DispatchWorkItem?
@@ -246,6 +248,8 @@ final class BLELampManager: NSObject {
         controllerAssemblies.removeAll()
         connectedLampID = ""
         lastRSSI = -127
+        rssiTask?.cancel()
+        rssiTask = nil
         if !keepPeripheral { peripheral = nil }
     }
 
@@ -491,7 +495,10 @@ extension BLELampManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
-        if error == nil { lastRSSI = RSSI.intValue }
+        guard error == nil else { return }
+        lastRSSI = RSSI.intValue
+        let lampID = connectedLampID
+        Task { @MainActor in delegate?.bleManager(self, didUpdateRSSI: RSSI.intValue, lampID: lampID) }
     }
 
     private func finishConnectionSetup(_ peripheral: CBPeripheral) {
@@ -500,6 +507,14 @@ extension BLELampManager: CBPeripheralDelegate {
         if connectedLampID.isEmpty { connectedLampID = lampID(fromName: connectedName) ?? "BLE-\(peripheral.identifier.uuidString.suffix(6))" }
         Task { @MainActor in delegate?.bleManager(self, didConnect: connectedLampID, peripheralID: peripheral.identifier, name: connectedName) }
         peripheral.readRSSI()
+        rssiTask?.cancel()
+        rssiTask = Task { [weak self, weak peripheral] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard let self, let peripheral, self.peripheral === peripheral else { return }
+                peripheral.readRSSI()
+            }
+        }
         if let batteryCharacteristic, batteryCharacteristic.properties.contains(.read) {
             peripheral.readValue(for: batteryCharacteristic)
         }

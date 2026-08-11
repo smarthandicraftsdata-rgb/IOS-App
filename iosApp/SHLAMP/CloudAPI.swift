@@ -243,7 +243,7 @@ final class CloudAPI {
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.setValue("SHLAMP-iOS/1.6.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.1", forHTTPHeaderField: "User-Agent")
         if let token, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body { request.httpBody = try jsonData(body) }
         let (data, response) = try await session.data(for: request)
@@ -354,6 +354,9 @@ final class CloudAPI {
             json.string("stateUpdatedAt", "updatedAt", "lastSeen", "lastSeenAt")
         )
         let adjustedTimer = adjustedTimerRemaining(reportedTimer, stateTimestamp: stateTimestamp)
+        let stateBootId = [stateJSON.int("bootId", "stateBootId"), rawJSON.int("bootId", "stateBootId"), json.int("bootId", "stateBootId")].compactMap { $0 }.first.map { Int64($0) }
+        let stateBootSequence = [stateJSON.int("bootSequence", "stateBootSequence"), rawJSON.int("bootSequence", "stateBootSequence"), json.int("bootSequence", "stateBootSequence")].compactMap { $0 }.first.map { Int64($0) }
+        let stateRevision = [stateJSON.int("stateRevision", "revision"), rawJSON.int("stateRevision", "revision"), json.int("stateRevision", "revision")].compactMap { $0 }.first.map { Int64($0) }
         let state = LampState(
             power: power,
             brightness: brightness,
@@ -364,7 +367,10 @@ final class CloudAPI {
             batteryVoltageMv: batteryValid ? batteryVoltage : nil,
             batteryCharging: batteryValid ? (stateJSON.bool("batteryCharging", "isCharging", "charging") ?? rawJSON.bool("batteryCharging", "isCharging", "charging") ?? json.bool("batteryCharging", "isCharging", "charging")) : nil,
             powerMode: LampPowerMode(rawValue: powerModeRaw) ?? .balanced,
-            runtimeState: LampRuntimeState(rawValue: runtimeStateRaw) ?? .unknown
+            runtimeState: LampRuntimeState(rawValue: runtimeStateRaw) ?? .unknown,
+            stateBootId: stateBootId,
+            stateBootSequence: stateBootSequence,
+            stateRevision: stateRevision
         )
         let online = json.bool("online", "isOnline") ?? (json.string("status").lowercased() == "online")
         return LampRecord(
