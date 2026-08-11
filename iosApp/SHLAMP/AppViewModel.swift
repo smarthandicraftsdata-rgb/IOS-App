@@ -61,6 +61,16 @@ final class AppViewModel: ObservableObject {
     private var brightnessStreamTasks: [String: Task<Void, Never>] = [:]
     private var pendingBrightnessValues: [String: Int] = [:]
     private var brightnessStreamGeneration: [String: Int] = [:]
+
+    // Short-lived field ownership prevents an older BLE/Wi-Fi/cloud echo from
+    // overwriting a control the user has just made. A matching device state
+    // clears the hold immediately; otherwise it expires quickly so real
+    // external changes are never hidden indefinitely.
+    private var pendingPowerHolds: [String: (value: Bool, expiresAt: Date)] = [:]
+    private var pendingBrightnessHolds: [String: (value: Int, expiresAt: Date)] = [:]
+    private var pendingFadeHolds: [String: (value: Int, expiresAt: Date)] = [:]
+    private var pendingTimerHolds: [String: (deadline: Date?, expiresAt: Date)] = [:]
+
     private var localFailureCounts: [String: Int] = [:]
 
     private let wifiHealthTTL: TimeInterval = 7
@@ -315,6 +325,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func setPower(_ lamp: LampRecord, on: Bool) {
+        setPendingPower(lamp, value: on)
         optimistic(lamp.id) {
             $0.state.power = on
             if on && $0.state.brightness == 0 { $0.state.brightness = 20 }
@@ -343,6 +354,7 @@ final class AppViewModel: ObservableObject {
 
         let requested = clamp(value, 0...100)
         let percent = lamp.state.powerMode == .maximumBackup ? min(requested, 70) : requested
+        setPendingBrightness(lamp, value: percent, lifetime: 3.0)
         optimistic(lamp.id) {
             $0.state.brightness = percent
             $0.state.power = percent > 0
@@ -372,6 +384,7 @@ final class AppViewModel: ObservableObject {
     func streamBrightness(_ lamp: LampRecord, value: Int) {
         let requested = clamp(value, 0...100)
         let percent = lamp.state.powerMode == .maximumBackup ? min(requested, 70) : requested
+        setPendingBrightness(lamp, value: percent, lifetime: 1.5)
         optimistic(lamp.id) {
             $0.state.brightness = percent
             $0.state.power = percent > 0
@@ -507,6 +520,7 @@ final class AppViewModel: ObservableObject {
 
     func setFade(_ lamp: LampRecord, mode: Int) {
         let value = clamp(mode, 0...3)
+        setPendingFade(lamp, value: value)
         optimistic(lamp.id) { $0.state.fadeMode = value }
         Task {
             do {
@@ -526,8 +540,9 @@ final class AppViewModel: ObservableObject {
     func setTimer(_ lamp: LampRecord, minutes: Int) {
         let value = [0, 15, 30, 60].contains(minutes) ? minutes : 0
         let seconds = Int64(value * 60)
+        setPendingTimer(lamp, seconds: seconds)
         optimistic(lamp.id) { $0.state.timerRemainingSeconds = seconds }
-        registerTimerState(for: lamp, remainingSeconds: seconds, receivedAt: Date())
+        _ = registerTimerState(for: lamp, remainingSeconds: seconds, receivedAt: Date(), isUserInitiated: true)
         scheduleTimerNotification(for: lamp, remainingSeconds: seconds)
         Task {
             do {
@@ -768,21 +783,61 @@ final class AppViewModel: ObservableObject {
         return now.timeIntervalSince(last) <= wifiHealthTTL
     }
 
-    private func registerTimerState(for lamp: LampRecord, remainingSeconds: Int64, receivedAt: Date) {
-        let keys = [lamp.id.uppercased(), lamp.cloudLampId?.uppercased()].compactMap { $0 }
+    @discardableResult
+    private func registerTimerState(
+        for lamp: LampRecord,
+        remainingSeconds: Int64,
+        receivedAt: Date,
+        isUserInitiated: Bool = false
+    ) -> Bool {
+        let keys = stateKeys(for: lamp)
+        let now = Date()
+
+        if !isUserInitiated {
+            let activeHold = keys.compactMap { pendingTimerHolds[$0] }
+                .filter { $0.expiresAt > now }
+                .max { $0.expiresAt < $1.expiresAt }
+
+            if let hold = activeHold {
+                let matches: Bool
+                if let expectedDeadline = hold.deadline {
+                    let expected = max(0, Int64(ceil(expectedDeadline.timeIntervalSince(now))))
+                    matches = remainingSeconds > 0 && Swift.abs(remainingSeconds - expected) <= 5
+                } else {
+                    matches = remainingSeconds == 0
+                }
+
+                if matches {
+                    clearTimerHold(for: lamp)
+                } else {
+                    // This is an older snapshot/echo from before the user's
+                    // latest timer command. Keep the existing deadline until
+                    // the matching acknowledgement arrives or the short hold
+                    // expires.
+                    return false
+                }
+            } else {
+                clearTimerHold(for: lamp)
+            }
+        }
+
         if remainingSeconds > 0 {
             let deadline = receivedAt.addingTimeInterval(TimeInterval(remainingSeconds))
             for key in keys { timerDeadlines[key] = deadline }
         } else {
             for key in keys { timerDeadlines.removeValue(forKey: key) }
         }
+        return true
     }
 
     func remainingTimerSeconds(for lamp: LampRecord) -> Int64 {
         _ = liveClock // Explicit dependency so SwiftUI refreshes once per second.
-        let keys = [lamp.id.uppercased(), lamp.cloudLampId?.uppercased()].compactMap { $0 }
+        let keys = stateKeys(for: lamp)
         if let deadline = keys.compactMap({ timerDeadlines[$0] }).max() {
-            return max(0, Int64(ceil(deadline.timeIntervalSince(liveClock))))
+            // Use a fresh clock for the calculation. `liveClock` is only the
+            // SwiftUI refresh trigger and can be almost one second behind,
+            // which previously allowed a new 15m timer to display as 15:01.
+            return max(0, Int64(ceil(deadline.timeIntervalSince(Date()))))
         }
         return max(0, lamp.state.timerRemainingSeconds)
     }
@@ -929,6 +984,98 @@ final class AppViewModel: ObservableObject {
         return candidates.contains(connectedLocalID.uppercased()) || lamp.bleIdentifier == ble.connectedPeripheralID
     }
 
+    private func stateKeys(for lamp: LampRecord) -> [String] {
+        var keys = [lamp.id.uppercased(), lamp.canonicalID.uppercased()]
+        if let cloudID = lamp.cloudLampId?.uppercased() { keys.append(cloudID) }
+        var seen: Set<String> = []
+        return keys.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    private func setPendingPower(_ lamp: LampRecord, value: Bool, lifetime: TimeInterval = 3.0) {
+        let hold = (value: value, expiresAt: Date().addingTimeInterval(lifetime))
+        for key in stateKeys(for: lamp) { pendingPowerHolds[key] = hold }
+    }
+
+    private func setPendingBrightness(_ lamp: LampRecord, value: Int, lifetime: TimeInterval) {
+        let hold = (value: value, expiresAt: Date().addingTimeInterval(lifetime))
+        for key in stateKeys(for: lamp) { pendingBrightnessHolds[key] = hold }
+    }
+
+    private func setPendingFade(_ lamp: LampRecord, value: Int, lifetime: TimeInterval = 3.0) {
+        let hold = (value: value, expiresAt: Date().addingTimeInterval(lifetime))
+        for key in stateKeys(for: lamp) { pendingFadeHolds[key] = hold }
+    }
+
+    private func setPendingTimer(_ lamp: LampRecord, seconds: Int64, lifetime: TimeInterval = 4.0) {
+        let deadline = seconds > 0 ? Date().addingTimeInterval(TimeInterval(seconds)) : nil
+        let hold = (deadline: deadline, expiresAt: Date().addingTimeInterval(lifetime))
+        for key in stateKeys(for: lamp) { pendingTimerHolds[key] = hold }
+    }
+
+    private func clearPowerHold(for lamp: LampRecord) {
+        for key in stateKeys(for: lamp) { pendingPowerHolds.removeValue(forKey: key) }
+    }
+
+    private func clearBrightnessHold(for lamp: LampRecord) {
+        for key in stateKeys(for: lamp) { pendingBrightnessHolds.removeValue(forKey: key) }
+    }
+
+    private func clearFadeHold(for lamp: LampRecord) {
+        for key in stateKeys(for: lamp) { pendingFadeHolds.removeValue(forKey: key) }
+    }
+
+    private func clearTimerHold(for lamp: LampRecord) {
+        for key in stateKeys(for: lamp) { pendingTimerHolds.removeValue(forKey: key) }
+    }
+
+    private func protectedIncomingState(_ incoming: LampState, for lamp: LampRecord, current: LampState) -> LampState {
+        var result = incoming
+        let now = Date()
+        let keys = stateKeys(for: lamp)
+
+        if let hold = keys.compactMap({ pendingBrightnessHolds[$0] })
+            .filter({ $0.expiresAt > now })
+            .max(by: { $0.expiresAt < $1.expiresAt }) {
+            if result.brightness == hold.value {
+                clearBrightnessHold(for: lamp)
+            } else {
+                result.brightness = current.brightness
+                // Brightness also determines lamp power in the firmware. Keep
+                // the optimistic power value unless a separate explicit power
+                // command currently owns that field.
+                result.power = current.power
+            }
+        } else {
+            clearBrightnessHold(for: lamp)
+        }
+
+        if let hold = keys.compactMap({ pendingPowerHolds[$0] })
+            .filter({ $0.expiresAt > now })
+            .max(by: { $0.expiresAt < $1.expiresAt }) {
+            if result.power == hold.value {
+                clearPowerHold(for: lamp)
+            } else {
+                result.power = current.power
+            }
+        } else {
+            clearPowerHold(for: lamp)
+        }
+
+        if let hold = keys.compactMap({ pendingFadeHolds[$0] })
+            .filter({ $0.expiresAt > now })
+            .max(by: { $0.expiresAt < $1.expiresAt }) {
+            if result.fadeMode == hold.value {
+                clearFadeHold(for: lamp)
+            } else {
+                result.fadeMode = current.fadeMode
+            }
+        } else {
+            clearFadeHold(for: lamp)
+        }
+
+        return result
+    }
+
     private func optimistic(_ lampID: String, change: (inout LampRecord) -> Void) {
         let now = Date()
         if let index = lamps.firstIndex(where: { $0.id == lampID }) {
@@ -978,11 +1125,17 @@ final class AppViewModel: ObservableObject {
         record.wifiRSSI = snapshot.rssi
         record.bleName = snapshot.bleName.isEmpty ? record.bleName : snapshot.bleName
         record.controllerCount = snapshot.controllerCount
-        record.state = LampState(
+        let currentState = lamps.first(where: { $0.canonicalID == record.canonicalID })?.state ?? record.state
+        let timerAccepted = registerTimerState(
+            for: record,
+            remainingSeconds: snapshot.timerRemainingSeconds,
+            receivedAt: receivedAt
+        )
+        let incomingState = LampState(
             power: snapshot.power,
             brightness: snapshot.targetBrightness,
             fadeMode: snapshot.fadeMode,
-            timerRemainingSeconds: snapshot.timerRemainingSeconds,
+            timerRemainingSeconds: timerAccepted ? snapshot.timerRemainingSeconds : currentState.timerRemainingSeconds,
             batteryValid: snapshot.batteryValid,
             batteryPercent: snapshot.batteryPercent,
             batteryVoltageMv: snapshot.batteryVoltageMv,
@@ -990,8 +1143,10 @@ final class AppViewModel: ObservableObject {
             powerMode: snapshot.powerMode,
             runtimeState: snapshot.runtimeState
         )
-        registerTimerState(for: record, remainingSeconds: snapshot.timerRemainingSeconds, receivedAt: receivedAt)
-        scheduleTimerNotification(for: record, remainingSeconds: snapshot.timerRemainingSeconds)
+        record.state = protectedIncomingState(incomingState, for: record, current: currentState)
+        if timerAccepted {
+            scheduleTimerNotification(for: record, remainingSeconds: snapshot.timerRemainingSeconds)
+        }
         let bluetoothPreferred = record.routePreference == .bluetooth && canUseBLE(record)
         record.route = bluetoothPreferred ? .bluetooth : .wifi
         if key != localID { localRecords.removeValue(forKey: key) }
@@ -1093,10 +1248,13 @@ final class AppViewModel: ObservableObject {
             localClearsOptimisticHold = optimisticAt == nil
         }
 
-        if (isWiFiHealthy(local) || canUseBLE(local)),
-           let localFullStateAt,
+        if let localFullStateAt,
            localClearsOptimisticHold,
            primaryFreshness == nil || localFullStateAt >= primaryFreshness! {
+            // Route health decides where the next command is sent; it must not
+            // erase a newer confirmed state just because that transport has
+            // temporarily fallen back. This prevents Local Wi-Fi -> Remote
+            // transitions from making brightness/timer jump backward.
             merged.state = local.state
         }
 
@@ -1150,7 +1308,8 @@ final class AppViewModel: ObservableObject {
         lamp.cloudClaimed = true
         lamp.route = lamp.online ? .cloud : .offline
 
-        if let existing = dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }) {
+        let existingDashboard = dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })
+        if let existing = existingDashboard {
             if lamp.name == "SH Lamp" && existing.name != "SH Lamp" { lamp.name = existing.name }
             if lamp.homeId.isEmpty || lamp.homeId == "default" { lamp.homeId = existing.homeId }
             lamp.roomId = lamp.roomId ?? existing.roomId
@@ -1160,10 +1319,17 @@ final class AppViewModel: ObservableObject {
             lamp.routePreference = existing.routePreference
         }
 
+        let currentState = lamps.first(where: { $0.canonicalID == lamp.canonicalID })?.state
+            ?? existingDashboard?.state
+            ?? lamp.state
+        let reportedTimer = lamp.state.timerRemainingSeconds
+        let timerAccepted = registerTimerState(for: lamp, remainingSeconds: reportedTimer, receivedAt: receivedAt)
+        if !timerAccepted { lamp.state.timerRemainingSeconds = currentState.timerRemainingSeconds }
+        lamp.state = protectedIncomingState(lamp.state, for: lamp, current: currentState)
+
         cloudStateReceivedAt[id] = receivedAt
         optimisticStateAt.removeValue(forKey: id)
-        registerTimerState(for: lamp, remainingSeconds: lamp.state.timerRemainingSeconds, receivedAt: receivedAt)
-        scheduleTimerNotification(for: lamp, remainingSeconds: lamp.state.timerRemainingSeconds)
+        if timerAccepted { scheduleTimerNotification(for: lamp, remainingSeconds: reportedTimer) }
         dashboard.lamps.removeAll { $0.id.caseInsensitiveCompare(id) == .orderedSame }
         dashboard.lamps.append(lamp)
         rebuildLamps()
@@ -1302,12 +1468,22 @@ extension AppViewModel: BLELampManagerDelegate {
         record.route = keepWiFi ? .wifi : .bluetooth
         record.online = true
         record.bleRSSI = status.rssi
-        record.state.power = status.power
-        record.state.brightness = status.targetBrightness
-        record.state.fadeMode = status.fadeMode
-        record.state.timerRemainingSeconds = status.timerRemainingSeconds
-        registerTimerState(for: record, remainingSeconds: status.timerRemainingSeconds, receivedAt: receivedAt)
-        scheduleTimerNotification(for: record, remainingSeconds: status.timerRemainingSeconds)
+
+        let currentState = lamps.first(where: { $0.canonicalID == record.canonicalID })?.state ?? record.state
+        let timerAccepted = registerTimerState(
+            for: record,
+            remainingSeconds: status.timerRemainingSeconds,
+            receivedAt: receivedAt
+        )
+        var incomingState = record.state
+        incomingState.power = status.power
+        incomingState.brightness = status.targetBrightness
+        incomingState.fadeMode = status.fadeMode
+        incomingState.timerRemainingSeconds = timerAccepted ? status.timerRemainingSeconds : currentState.timerRemainingSeconds
+        record.state = protectedIncomingState(incomingState, for: record, current: currentState)
+        if timerAccepted {
+            scheduleTimerNotification(for: record, remainingSeconds: status.timerRemainingSeconds)
+        }
         localRecords[key] = record
         rebuildLamps()
     }

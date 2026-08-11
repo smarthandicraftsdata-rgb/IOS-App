@@ -68,6 +68,10 @@ struct LampControlView: View {
                     fallbackInitialScrollY = nil
                 }
                 .onChange(of: lamp.state.brightness) { _, newValue in
+                    // While the user owns the slider, delayed BLE/Wi-Fi/cloud
+                    // echoes must not move the thumb underneath their finger.
+                    // The final released value is reconciled by AppViewModel.
+                    guard !brightnessDragging else { return }
                     draftBrightness = Double(newValue)
                 }
                 .onChange(of: lamp.state.powerMode) { _, mode in
@@ -629,10 +633,13 @@ struct LampControlView: View {
     }
 
     private func timerPreset(for seconds: Int64) -> Int {
+        // Allow a small transport/clock tolerance around the preset boundary.
+        // Without this, a freshly-set 15 minute timer can render as 15:01 for
+        // one frame and incorrectly highlight the 30m button.
         switch seconds {
         case ...0: return 0
-        case ...900: return 15
-        case ...1800: return 30
+        case ...905: return 15
+        case ...1805: return 30
         default: return 60
         }
     }
