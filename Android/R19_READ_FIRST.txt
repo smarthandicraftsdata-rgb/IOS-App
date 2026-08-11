@@ -1,0 +1,29 @@
+SH Lamp Android App R19 - Clean Build Fix
+Version 1.3.1 (versionCode 6)
+
+The requested phone-style battery UI is retained:
+- phone/iPhone-style battery icon
+- red at 20 percent or lower
+- green pulsing lightning animation when a real charging flag is received
+- no user-facing live-voltage or percentage-calculation panel
+
+Build-system correction for:
+Cause: readString(...) must not be null
+
+Changes:
+1. Disabled Gradle configuration cache for this troubleshooting release.
+2. Disabled Kotlin incremental compilation/classpath snapshots for the first clean build.
+3. Removed the Foojay daemon-JVM resolver plugin and generated daemon JVM criteria file.
+4. Added CLEAN_BUILD_WINDOWS.bat.
+5. Kept Gradle 9.4.1 and Android Gradle Plugin 9.2.1 unchanged.
+
+Required first open:
+1. Close Android Studio.
+2. Extract this ZIP into a NEW folder. Do not merge it over the old project.
+3. Run CLEAN_BUILD_WINDOWS.bat once.
+4. Open the new project folder in Android Studio.
+5. Set Settings > Build, Execution, Deployment > Build Tools > Gradle > Gradle JDK to Embedded JDK (17 or newer).
+6. File > Sync Project with Gradle Files.
+7. Build > Rebuild Project.
+
+Do not click the "New Minor Gradle Version Available" update while testing this release.

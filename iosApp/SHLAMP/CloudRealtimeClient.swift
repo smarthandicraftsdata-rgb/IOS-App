@@ -1,0 +1,184 @@
+import Foundation
+
+@MainActor
+protocol CloudRealtimeClientDelegate: AnyObject {
+    func realtimeClient(_ client: CloudRealtimeClient, didChangeStatus status: String, connected: Bool)
+    func realtimeClient(_ client: CloudRealtimeClient, didReceive object: JSONObject)
+}
+
+final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
+    weak var delegate: CloudRealtimeClientDelegate?
+
+    private let baseURL: URL
+    private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+    private var task: URLSessionWebSocketTask?
+    private var stopped = true
+    private var token = ""
+    private var homeID = ""
+    private var candidates: [URL] = []
+    private var candidateIndex = 0
+    private var reconnectAttempt = 0
+    private var pingTask: Task<Void, Never>?
+
+    init(baseURL: URL = AppEnvironment.cloudBaseURL) {
+        self.baseURL = baseURL
+    }
+
+    func start(token: String, homeID: String, force: Bool = false) {
+        if !force, !stopped, self.token == token, self.homeID == homeID, task != nil { return }
+        stop(closeOnly: true)
+        stopped = false
+        self.token = token
+        self.homeID = homeID
+        self.candidates = makeCandidates()
+        candidateIndex = 0
+        connectNext()
+    }
+
+    func stop() { stop(closeOnly: false) }
+
+    /// Sends a command through the already-authenticated app WebSocket.
+    /// Intermediate slider traffic uses `liveCommand` so it is not persisted
+    /// as a database command on every drag update. The final slider value and
+    /// all discrete controls continue to use the durable `command` path.
+    func sendCommand(
+        lampID: String,
+        action: String,
+        value: Any,
+        live: Bool = false,
+        commandID: String = UUID().uuidString
+    ) async throws -> String {
+        let object: JSONObject = [
+            "type": live ? "liveCommand" : "command",
+            "lampId": lampID,
+            "commandId": commandID,
+            "action": action,
+            "value": value
+        ]
+        try await sendJSONObject(object)
+        return commandID
+    }
+
+    func requestState(lampID: String) async throws -> String {
+        try await sendCommand(lampID: lampID, action: "requestState", value: NSNull())
+    }
+
+    private func stop(closeOnly: Bool) {
+        if !closeOnly { stopped = true }
+        pingTask?.cancel()
+        pingTask = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+    }
+
+    private func connectNext() {
+        guard !stopped, task == nil else { return }
+        guard candidateIndex < candidates.count else {
+            scheduleReconnect("Live cloud reconnecting…")
+            return
+        }
+        let url = candidates[candidateIndex]
+        candidateIndex += 1
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("SHLAMP-iOS/1.6.0", forHTTPHeaderField: "User-Agent")
+        Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Connecting live cloud…", connected: false) }
+        let newTask = session.webSocketTask(with: request)
+        task = newTask
+        newTask.resume()
+        receiveLoop(newTask)
+    }
+
+    private func sendJSONObject(_ object: JSONObject) async throws {
+        guard !stopped, let socket = task else {
+            throw AppError.message("Live cloud is not connected.")
+        }
+        let data = try jsonData(object)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw AppError.message("Could not encode the live cloud command.")
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            socket.send(.string(text)) { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: ()) }
+            }
+        }
+    }
+
+    private func receiveLoop(_ socket: URLSessionWebSocketTask) {
+        socket.receive { [weak self, weak socket] result in
+            guard let self, let socket, self.task === socket, !self.stopped else { return }
+            switch result {
+            case .failure:
+                self.task = nil
+                if self.candidateIndex < self.candidates.count { self.connectNext() }
+                else { self.scheduleReconnect("Live cloud reconnecting…") }
+            case .success(let message):
+                let text: String
+                switch message {
+                case .string(let value): text = value
+                case .data(let data): text = String(data: data, encoding: .utf8) ?? ""
+                @unknown default: text = ""
+                }
+                if let data = text.data(using: .utf8), let object = try? parseJSONObject(data) {
+                    let type = object.string("type")
+                    if type.caseInsensitiveCompare("authOk") == .orderedSame,
+                       object.string("connection").caseInsensitiveCompare("app") == .orderedSame {
+                        self.reconnectAttempt = 0
+                        Task { @MainActor in self.delegate?.realtimeClient(self, didChangeStatus: "Live cloud connected.", connected: true) }
+                    }
+                    Task { @MainActor in self.delegate?.realtimeClient(self, didReceive: object) }
+                }
+                self.receiveLoop(socket)
+            }
+        }
+    }
+
+    private func scheduleReconnect(_ status: String) {
+        guard !stopped else { return }
+        task = nil
+        Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: status, connected: false) }
+        let exponent = min(reconnectAttempt, 4)
+        let delay = min(1.5 * pow(2.0, Double(exponent)), 20.0)
+        reconnectAttempt += 1
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !self.stopped else { return }
+            self.candidateIndex = 0
+            self.connectNext()
+        }
+    }
+
+    private func makeCandidates() -> [URL] {
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.scheme = baseURL.scheme == "http" ? "ws" : "wss"
+        return ["/ws/app", "/api/ws/app"].compactMap { path in
+            var copy = components
+            copy?.path = path
+            return copy?.url
+        }
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        guard task === webSocketTask, !stopped else { return }
+        let auth: JSONObject = ["type": "auth", "token": token]
+        if let data = try? jsonData(auth), let text = String(data: data, encoding: .utf8) {
+            webSocketTask.send(.string(text)) { _ in }
+        }
+        Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Authenticating cloud account…", connected: false) }
+        pingTask?.cancel()
+        pingTask = Task { [weak self, weak webSocketTask] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(25))
+                guard let self, let webSocketTask, self.task === webSocketTask else { return }
+                webSocketTask.sendPing { _ in }
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        guard task === webSocketTask else { return }
+        task = nil
+        if !stopped { scheduleReconnect("Live cloud reconnecting…") }
+    }
+}

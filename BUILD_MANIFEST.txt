@@ -1,17 +1,32 @@
-SH Lamp Android + iOS Conversion Build Manifest
-Generated: 2026-08-01
-Android source version: 1.3.1 (versionCode 6)
+SH Lamp Android + iOS Integrated Release Manifest
+Generated: 2026-08-06
+Android source version: 1.5.0 (versionCode 7)
+iOS version: 1.5.0 (build 10)
 iOS deployment target: 17.0
 iOS bundle identifier: com.smarthandicrafts.shlamp
 Codemagic workflow: ios-unsigned-sideloadly
+Target firmware: TTP2-WIFI-BLE-R19B-P3-20260806
 
 Swift files: 19
-Android files: 72
-Total files: 108
 
-Validation:
-PROJECT VERIFICATION PASSED
-Swift files: 19
-Swift source SHA-256: b3d5057d0fbc96b1f575663a8397d3bf2ab30b64536f4c36c61be7d9d946848d
-Codemagic workflow: ios-unsigned-sideloadly
-Swift parser validation passed for 19 files.
+Integrated scope:
+- One canonical physical-lamp record across BLE, local Wi-Fi and cloud
+- Existing duplicate-record migration and alias merging
+- Automatic Local Wi-Fi > Bluetooth > Remote > Offline route selection
+- Immediate phone Wi-Fi/Bluetooth state reaction and command failover
+- Manual Automatic/Wi-Fi/Bluetooth/Remote route preference
+- Nearby identity probing through FFE3 without creating another device
+- Explicit Bluetooth-only, Wi-Fi and remote-access setup paths
+- Wi-Fi provisioning separated from cloud claiming
+- Remote access available immediately or later from settings
+- Collapsible lamp-control header and compact sticky banner
+- iPhone-style battery indicator
+- Balanced, Maximum Backup, BLE Only and Touch Only controls
+- Runtime-state display and Maximum Backup 70% synchronization
+- BLE initial-status deduplication and persistent app-level connections
+
+Validation boundary:
+- Swift parsing and model type-check completed
+- Project and protocol audit scripts completed
+- Android source structural scan completed
+- Full Android Studio, Xcode/Codemagic and physical-lamp runtime tests remain required

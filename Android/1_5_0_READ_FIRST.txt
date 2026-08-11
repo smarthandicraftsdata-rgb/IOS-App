@@ -1,0 +1,18 @@
+SH Lamp Android 1.5.0 (versionCode 7)
+
+Open this `android` folder directly in Android Studio.
+
+Main changes:
+- one device record across Bluetooth, local Wi-Fi and Remote
+- automatic Local Wi-Fi > Bluetooth > Remote failover
+- live phone Wi-Fi/Bluetooth state handling
+- corrected Add Lamp flow with Bluetooth-only and Wi-Fi paths
+- optional remote access now or later
+- collapsible lamp-control header and iPhone-style battery
+- Balanced, Maximum Backup, BLE Only and Touch Only controls
+- Maximum Backup actual 70% synchronization
+
+Target firmware: TTP2-WIFI-BLE-R19B-P3-20260806
+
+After opening, let Android Studio download/sync Gradle dependencies, then Build > Make Project.
+Use docs/TEST_CHECKLIST_1_5_0.md for the physical-lamp tests.

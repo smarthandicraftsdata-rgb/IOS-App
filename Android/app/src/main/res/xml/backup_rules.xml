@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Account tokens, claim progress and nearby-controller identity must not leave this device. -->
+    <exclude domain="sharedpref" path="shlamp_cloud_session.xml" />
+    <exclude domain="sharedpref" path="shlamp_setup_progress.xml" />
+    <exclude domain="sharedpref" path="shlamp_phase1_multilamp.xml" />
+</full-backup-content>
