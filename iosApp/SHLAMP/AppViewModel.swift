@@ -731,7 +731,7 @@ final class AppViewModel: ObservableObject {
 
     private func markWiFiFailure(for lamp: LampRecord) {
         let key = lamp.id.uppercased()
-        wifiConfirmedAt.removeValue(forKey: key)
+        for stateKey in stateKeys(for: lamp) { wifiConfirmedAt.removeValue(forKey: stateKey) }
         let failures = (localFailureCounts[key] ?? 0) + 1
         localFailureCounts[key] = failures
         updateLocalRecord(for: lamp) { record in
@@ -778,7 +778,10 @@ final class AppViewModel: ObservableObject {
                     for record in records {
                         guard let host = record.localHost else { continue }
                         let key = record.id.uppercased()
-                        if self.local.isRealtimeHealthy(host: host) { continue }
+                        // RF2: a realtime state socket proves only the event channel.
+                        // Keep one HTTP status probe after every phone Wi-Fi transition
+                        // before LAN is allowed to become the command route.
+                        if self.local.isRealtimeHealthy(host: host), self.hasWiFiCommandConfirmation(record) { continue }
                         guard !self.localPollInFlight.contains(key) else { continue }
                         self.localPollInFlight.insert(key)
                         Task { @MainActor [weak self] in
@@ -800,7 +803,7 @@ final class AppViewModel: ObservableObject {
 
     private func noteLocalPollFailure(_ lamp: LampRecord) {
         let key = lamp.id.uppercased()
-        wifiConfirmedAt.removeValue(forKey: key)
+        for stateKey in stateKeys(for: lamp) { wifiConfirmedAt.removeValue(forKey: stateKey) }
         let failures = (localFailureCounts[key] ?? 0) + 1
         localFailureCounts[key] = failures
         guard failures >= 3, var record = localRecords[key] else {
@@ -815,11 +818,23 @@ final class AppViewModel: ObservableObject {
         rebuildLamps()
     }
 
+    private func hasWiFiCommandConfirmation(_ lamp: LampRecord) -> Bool {
+        stateKeys(for: lamp).contains { wifiConfirmedAt[$0] != nil }
+    }
+
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
         guard wifiPathAvailable, let host = lamp.localHost else { return false }
+        let keys = stateKeys(for: lamp)
+        guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else {
+            // RF2: Local WebSocket is state/event-only in Phase A. It must not
+            // promote LAN to the command route until HTTP has succeeded once
+            // on the current phone Wi-Fi attachment.
+            return false
+        }
+        // Once HTTP has been proven on this Wi-Fi attachment, an actively
+        // receiving local realtime socket keeps LAN healthy without 2-second
+        // HTTP polling. If realtime is down, fall back to the short HTTP TTL.
         if local.isRealtimeHealthy(host: host, now: now) { return true }
-        let keys = [lamp.id.uppercased(), lamp.cloudLampId?.uppercased()].compactMap { $0 }
-        guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else { return false }
         return now.timeIntervalSince(last) <= wifiHealthTTL
     }
 
@@ -943,10 +958,30 @@ final class AppViewModel: ObservableObject {
                 self.wifiPathAvailable = hasWiFi
                 guard changed else { return }
                 if hasWiFi {
-                    // Re-open remembered realtime sockets immediately instead
-                    // of waiting for Bonjour rediscovery after Wi-Fi returns.
-                    for host in Set(self.localRecords.values.compactMap(\.localHost)) {
+                    // RF2 make-before-break handover: realtime state may resume
+                    // immediately, but LAN does not become the command route until
+                    // HTTP /api/status has succeeded on this new phone Wi-Fi path.
+                    self.wifiConfirmedAt.removeAll()
+                    let remembered = Array(self.localRecords.values.filter { $0.localHost != nil })
+                    for record in remembered {
+                        guard let host = record.localHost else { continue }
                         self.local.startRealtime(host: host)
+                        let key = record.id.uppercased()
+                        guard !self.localPollInFlight.contains(key) else { continue }
+                        self.localPollInFlight.insert(key)
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            defer { self.localPollInFlight.remove(key) }
+                            let requestStartedAt = Date()
+                            if let snapshot = try? await self.local.readStatus(host: host) {
+                                self.apply(snapshot: snapshot, observedAt: requestStartedAt)
+                            } else {
+                                // Do not throw away a remembered host after one
+                                // transition-time miss. The normal polling/failure
+                                // policy will retry and fall through to BLE/cloud.
+                                self.rebuildLamps()
+                            }
+                        }
                     }
                     self.local.startDiscovery()
                 } else {
@@ -1138,21 +1173,30 @@ final class AppViewModel: ObservableObject {
         if var local = localRecords[lampID] { change(&local); localRecords[lampID] = local }
     }
 
-    private func apply(snapshot: WiFiLampSnapshot, observedAt: Date = Date(), authoritative: Bool = false) {
+    private func apply(
+        snapshot: WiFiLampSnapshot,
+        observedAt: Date = Date(),
+        authoritative: Bool = false,
+        confirmsWiFiCommandPath: Bool = true
+    ) {
         let localID = snapshot.lampId.uppercased()
         let receivedAt = Date()
         let stateObservedAt = authoritative ? receivedAt : observedAt
         localSnapshots[localID] = snapshot
         local.startRealtime(host: snapshot.host)
-        wifiConfirmedAt[localID] = receivedAt
+        if confirmsWiFiCommandPath {
+            wifiConfirmedAt[localID] = receivedAt
+            localFailureCounts[localID] = 0
+        }
         localStateReceivedAt[localID] = stateObservedAt
-        localFailureCounts[localID] = 0
 
         let cloudID = snapshot.cloudLampId?.uppercased()
         if let cloudID {
-            wifiConfirmedAt[cloudID] = receivedAt
+            if confirmsWiFiCommandPath {
+                wifiConfirmedAt[cloudID] = receivedAt
+                localFailureCounts[cloudID] = 0
+            }
             localStateReceivedAt[cloudID] = stateObservedAt
-            localFailureCounts[cloudID] = 0
         }
         let existingKey = localRecords.keys.first { key in
             key == localID ||
@@ -1712,7 +1756,12 @@ extension AppViewModel: BLELampManagerDelegate {
 extension AppViewModel: LocalLampControllerDelegate {
     func localController(_ controller: LocalLampController, didDiscover snapshot: WiFiLampSnapshot) { apply(snapshot: snapshot) }
     func localController(_ controller: LocalLampController, didReceiveRealtime snapshot: WiFiLampSnapshot) {
-        apply(snapshot: snapshot, observedAt: Date(), authoritative: true)
+        apply(
+            snapshot: snapshot,
+            observedAt: Date(),
+            authoritative: true,
+            confirmsWiFiCommandPath: false
+        )
     }
     func localController(_ controller: LocalLampController, didChangeStatus status: String) { localNetworkStatus = status }
 }
