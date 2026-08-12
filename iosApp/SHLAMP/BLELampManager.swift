@@ -68,6 +68,7 @@ final class BLELampManager: NSObject {
     private var initialStateRequested = false
     private var connectionSetupCompleted = false
     private var scanStopWorkItem: DispatchWorkItem?
+    private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var lastStatusRequestAt = Date.distantPast
     // RF5 ordered ACKs are touched by app tasks and CoreBluetooth callbacks.
     // Keep continuation ownership serialized so a timeout/disconnect/ACK race
@@ -88,12 +89,15 @@ final class BLELampManager: NSObject {
     var connectedPeripheralID: UUID? { peripheral?.identifier }
     var isBluetoothPoweredOn: Bool { central.state == .poweredOn }
     var isReady: Bool { isBluetoothPoweredOn && peripheral != nil && controlCharacteristic != nil }
+    var isConnecting: Bool { isBluetoothPoweredOn && peripheral != nil && controlCharacteristic == nil }
+    var isScanning: Bool { central.isScanning }
 
     func startScan() {
         guard central.state == .poweredOn else {
             publishStatus("Turn on Bluetooth to search for lamps.")
             return
         }
+        guard !central.isScanning else { return }
         discovered.removeAll()
         publishNearby()
         central.scanForPeripherals(withServices: [serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
@@ -110,17 +114,61 @@ final class BLELampManager: NSObject {
     }
 
     func connect(to peripheralID: UUID) {
-        guard let item = discovered[peripheralID] else {
-            publishError("The selected lamp is no longer nearby. Scan again.")
+        if let item = discovered[peripheralID] {
+            beginConnection(
+                item.peripheral,
+                advertisedName: item.lamp.advertisedName,
+                lampID: item.lamp.lampId
+            )
             return
         }
-        disconnect()
-        peripheral = item.peripheral
-        connectedName = item.lamp.advertisedName
-        connectedLampID = item.lamp.lampId
-        item.peripheral.delegate = self
-        central.connect(item.peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
-        publishStatus("Connecting to \(item.lamp.advertisedName)…")
+
+        // RF5.2.1: CoreBluetooth identifiers are persistent for the app. A
+        // reconnect must not depend on catching a fresh advertisement inside
+        // one 10-second scan window.
+        if let remembered = central.retrievePeripherals(withIdentifiers: [peripheralID]).first {
+            let name = remembered.name ?? "SH Lamp"
+            beginConnection(
+                remembered,
+                advertisedName: name,
+                lampID: lampID(fromName: name) ?? ""
+            )
+            return
+        }
+
+        publishStatus("Lamp not cached by Bluetooth yet; scanning again…")
+        startScan()
+    }
+
+    private func beginConnection(_ target: CBPeripheral, advertisedName: String, lampID: String) {
+        if let current = peripheral, current.identifier != target.identifier {
+            central.cancelPeripheralConnection(current)
+        }
+        clearConnection(keepPeripheral: false)
+
+        peripheral = target
+        connectedName = advertisedName
+        connectedLampID = lampID
+        target.delegate = self
+        central.connect(target, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
+        publishStatus("Connecting to \(advertisedName)…")
+
+        connectionTimeoutWorkItem?.cancel()
+        let targetID = target.identifier
+        let timeout = DispatchWorkItem { [weak self, weak target] in
+            guard let self,
+                  let target,
+                  self.peripheral?.identifier == targetID,
+                  !self.isReady else { return }
+            self.central.cancelPeripheralConnection(target)
+            self.clearConnection(keepPeripheral: false)
+            self.publishStatus("Bluetooth reconnect timed out; retrying discovery…")
+            Task { @MainActor in
+                self.delegate?.bleManager(self, didDisconnect: targetID)
+            }
+        }
+        connectionTimeoutWorkItem = timeout
+        DispatchQueue.global().asyncAfter(deadline: .now() + 9, execute: timeout)
     }
 
     func disconnect() {
@@ -373,6 +421,8 @@ final class BLELampManager: NSObject {
     }
 
     private func clearConnection(keepPeripheral: Bool) {
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         controlCharacteristic = nil
         wifiCharacteristic = nil
         identityCharacteristic = nil
@@ -684,6 +734,8 @@ extension BLELampManager: CBPeripheralDelegate {
 
     private func finishConnectionSetup(_ peripheral: CBPeripheral) {
         guard controlCharacteristic != nil, !connectionSetupCompleted else { return }
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         connectionSetupCompleted = true
         if connectedLampID.isEmpty { connectedLampID = lampID(fromName: connectedName) ?? "BLE-\(peripheral.identifier.uuidString.suffix(6))" }
         Task { @MainActor in delegate?.bleManager(self, didConnect: connectedLampID, peripheralID: peripheral.identifier, name: connectedName) }

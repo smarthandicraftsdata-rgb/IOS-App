@@ -1,0 +1,46 @@
+PASS: RF5.2.1 recovery supervisor exists
+PASS: recovery supervisor starts at init
+PASS: recovery cadence 2 seconds
+PASS: remembered localHost is never nulled
+PASS: poll failures preserve remembered host
+PASS: LAN failures fall back through selectedRoute
+PASS: offline LAN actively recovers known websocket host
+PASS: Bonjour refreshed while LAN unavailable
+PASS: Bonjour recovery cadence bounded
+PASS: Wi-Fi attach forces fresh Bonjour generation
+PASS: local discovery restart does not call stopAllRealtime
+PASS: local discovery restart clears de-dup cache
+PASS: realtime started timestamp tracked
+PASS: half-open local socket rebuilt after bounded startup window
+PASS: recovery cancels stale socket before restart
+PASS: BLE reconnect uses remembered peripheral UUID
+PASS: BLE connection timeout exists
+PASS: BLE timeout is 9 seconds
+PASS: BLE recovery does not restart while connecting
+PASS: BLE recovery cadence bounded
+PASS: BLE scan fallback retained
+PASS: RF5.2 cloud route recovery retained
+PASS: RF5.2 local realtime health proof retained
+PASS: Cloud-to-LAN fence retained
+PASS: RF5.1 remembered brightness retained
+PASS: version 1.7.7
+PASS: build 19
+PASS: new User-Agent applied to Local/Cloud
+PASS: behavior: same Wi-Fi, cloud offline, local stale
+PASS: behavior: Bluetooth on, scan previously expired, UUID known
+PASS: behavior: Bluetooth on, no UUID learned
+PASS: behavior: BLE connection already pending
+PASS: behavior: local and cloud both unavailable but recoveries continue
+PASS: 20000 randomized recovery invariants
+PASS: ordering unchanged: func setPower(_ lamp: LampRecord, on: Bool)
+PASS: ordering unchanged: func setBrightness(_ lamp: LampRecord, value: Int)
+PASS: ordering unchanged: func streamBrightness(_ lamp: LampRecord, value: Int)
+PASS: ordering unchanged: private func makeOutputIntent(
+PASS: ordering unchanged: private func performOrderedRouted(
+PASS: ordering unchanged: private func sendCloudOrderedCommand(
+PASS: ordering unchanged: private func nextControlIntent(
+PASS: ordering unchanged: private func isCurrentControlIntent(
+PASS: ordering unchanged: func setFade(_ lamp: LampRecord, mode: Int)
+PASS: ordering unchanged: func setTimer(_ lamp: LampRecord, minutes: Int)
+
+44/44 checks passed

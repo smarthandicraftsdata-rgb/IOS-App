@@ -15,11 +15,13 @@ final class LocalLampController: NSObject {
     private var discoveredHosts: Set<String> = []
     private let session: URLSession
     private var discoveryRunning = false
+    private var discoveryRestartTask: Task<Void, Never>?
 
     // R21A additive realtime transport. HTTP remains the fallback for old
     // firmware and for any WebSocket interruption.
     private let realtimeLock = NSLock()
     private var realtimeTasks: [String: URLSessionWebSocketTask] = [:]
+    private var realtimeStartedAt: [String: Date] = [:]
     private var realtimeLastMessageAt: [String: Date] = [:]
     private var realtimeValidatedHosts: Set<String> = []
     private var realtimeHeartbeatTasks: [String: Task<Void, Never>] = [:]
@@ -45,11 +47,33 @@ final class LocalLampController: NSObject {
         publishStatus("Checking the local Wi-Fi for SH Lamps…")
     }
 
+    /// RF5.2.1: force a new Bonjour generation without tearing down healthy
+    /// realtime sockets. This clears the per-search host de-duplication cache,
+    /// which otherwise could keep a rediscovered lamp invisible after a
+    /// transient route failure.
+    func restartDiscovery() {
+        discoveryRestartTask?.cancel()
+        browser.stop()
+        resolving.values.forEach { $0.stop() }
+        resolving.removeAll()
+        discoveredHosts.removeAll()
+        discoveryRunning = false
+
+        discoveryRestartTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled, let self else { return }
+            self.startDiscovery()
+        }
+    }
+
     func stopDiscovery() {
+        discoveryRestartTask?.cancel()
+        discoveryRestartTask = nil
         discoveryRunning = false
         browser.stop()
         resolving.values.forEach { $0.stop() }
         resolving.removeAll()
+        discoveredHosts.removeAll()
         stopAllRealtime()
     }
 
@@ -77,6 +101,7 @@ final class LocalLampController: NSObject {
             return
         }
         realtimeTasks[clean] = socket
+        realtimeStartedAt[clean] = Date()
         realtimeLock.unlock()
 
         socket.resume()
@@ -89,6 +114,7 @@ final class LocalLampController: NSObject {
         let clean = normalizedRealtimeHost(host)
         realtimeLock.lock()
         let socket = realtimeTasks.removeValue(forKey: clean)
+        realtimeStartedAt.removeValue(forKey: clean)
         realtimeLastMessageAt.removeValue(forKey: clean)
         realtimeValidatedHosts.remove(clean)
         let heartbeat = realtimeHeartbeatTasks.removeValue(forKey: clean)
@@ -109,6 +135,42 @@ final class LocalLampController: NSObject {
         realtimeLock.unlock()
         guard hasTask, validated, let last else { return false }
         return now.timeIntervalSince(last) <= 16
+    }
+
+    /// Ensure a remembered local endpoint is actively recoverable. A socket
+    /// that has not produced authoritative state within six seconds is treated
+    /// as half-open and rebuilt instead of waiting indefinitely.
+    func recoverRealtime(host: String, now: Date = Date()) {
+        let clean = normalizedRealtimeHost(host)
+        guard !clean.isEmpty else { return }
+
+        realtimeLock.lock()
+        let socket = realtimeTasks[clean]
+        let startedAt = realtimeStartedAt[clean]
+        let last = realtimeLastMessageAt[clean]
+        let validated = realtimeValidatedHosts.contains(clean)
+        let heartbeat = realtimeHeartbeatTasks[clean]
+        let reconnect = realtimeReconnectTasks[clean]
+        let healthy = socket != nil && validated && last.map { now.timeIntervalSince($0) <= 16 } == true
+        let stillStarting = socket != nil && startedAt.map { now.timeIntervalSince($0) < 6 } == true
+
+        if healthy || stillStarting {
+            realtimeLock.unlock()
+            return
+        }
+
+        realtimeTasks.removeValue(forKey: clean)
+        realtimeStartedAt.removeValue(forKey: clean)
+        realtimeLastMessageAt.removeValue(forKey: clean)
+        realtimeValidatedHosts.remove(clean)
+        realtimeHeartbeatTasks.removeValue(forKey: clean)
+        realtimeReconnectTasks.removeValue(forKey: clean)
+        realtimeLock.unlock()
+
+        heartbeat?.cancel()
+        reconnect?.cancel()
+        socket?.cancel(with: .goingAway, reason: nil)
+        startRealtime(host: clean)
     }
 
     // RF5 ordered LAN mutation. Protocol v3 adds command IDs plus the same
@@ -240,7 +302,7 @@ final class LocalLampController: NSObject {
         request.timeoutInterval = 3
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.7.6-RF5.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.9-RF5.3", forHTTPHeaderField: "User-Agent")
         request.httpBody = try jsonData(orderedObject(intent))
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -380,6 +442,7 @@ final class LocalLampController: NSObject {
             return
         }
         realtimeTasks.removeValue(forKey: host)
+        realtimeStartedAt.removeValue(forKey: host)
         realtimeLastMessageAt.removeValue(forKey: host)
         realtimeValidatedHosts.remove(host)
         let heartbeat = realtimeHeartbeatTasks.removeValue(forKey: host)
@@ -407,6 +470,7 @@ final class LocalLampController: NSObject {
         let heartbeats = Array(realtimeHeartbeatTasks.values)
         let reconnects = Array(realtimeReconnectTasks.values)
         realtimeTasks.removeAll()
+        realtimeStartedAt.removeAll()
         realtimeLastMessageAt.removeAll()
         realtimeValidatedHosts.removeAll()
         realtimeHeartbeatTasks.removeAll()
@@ -520,7 +584,7 @@ final class LocalLampController: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.7.6-RF5.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.9-RF5.3", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? ""

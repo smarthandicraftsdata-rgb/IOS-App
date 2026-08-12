@@ -4,6 +4,7 @@ import Foundation
 protocol CloudRealtimeClientDelegate: AnyObject {
     func realtimeClient(_ client: CloudRealtimeClient, didChangeStatus status: String, connected: Bool)
     func realtimeClient(_ client: CloudRealtimeClient, didReceive object: JSONObject)
+    func realtimeClientNeedsAccessTokenRefresh(_ client: CloudRealtimeClient)
 }
 
 final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
@@ -21,6 +22,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
     private var pingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var authTimeoutTask: Task<Void, Never>?
+    private var tokenRefreshRequested = false
     private let ackLock = NSLock()
     private var ackWaiters: [String: (lampID: String, continuation: CheckedContinuation<JSONObject, Error>, timeout: Task<Void, Never>)] = [:]
 
@@ -34,6 +36,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         stopped = false
         self.token = token
         self.homeID = homeID
+        self.tokenRefreshRequested = false
         self.candidates = makeCandidates()
         candidateIndex = 0
         connectNext()
@@ -165,7 +168,11 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func connectNext() {
-        guard !stopped, task == nil else { return }
+        guard !stopped, task == nil, !tokenRefreshRequested else { return }
+        if accessTokenExpiresSoon() {
+            requestFreshAccessToken("Refreshing cloud session…")
+            return
+        }
         guard candidateIndex < candidates.count else {
             scheduleReconnect("Live cloud reconnecting…")
             return
@@ -176,7 +183,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         candidateIndex += 1
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("SHLAMP-iOS/1.7.6-RF5.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.9-RF5.3", forHTTPHeaderField: "User-Agent")
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Connecting live cloud…", connected: false) }
         let newTask = session.webSocketTask(with: request)
         task = newTask
@@ -271,6 +278,42 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    private func accessTokenExpiresSoon(leeway: TimeInterval = 30) -> Bool {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return true }
+
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder != 0 { payload += String(repeating: "=", count: 4 - remainder) }
+
+        guard let data = Data(base64Encoded: payload),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let expiration = (object["exp"] as? NSNumber)?.doubleValue else {
+            return true
+        }
+        return expiration <= Date().timeIntervalSince1970 + leeway
+    }
+
+    private func requestFreshAccessToken(_ status: String) {
+        guard !stopped, !tokenRefreshRequested else { return }
+        tokenRefreshRequested = true
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        pingTask?.cancel()
+        pingTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        authTimeoutTask?.cancel()
+        authTimeoutTask = nil
+        failAllAcks(AppError.message("Cloud account token changed before command acknowledgement."))
+        Task { @MainActor in
+            delegate?.realtimeClient(self, didChangeStatus: status, connected: false)
+            delegate?.realtimeClientNeedsAccessTokenRefresh(self)
+        }
+    }
+
     private func makeCandidates() -> [URL] {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         components?.scheme = baseURL.scheme == "http" ? "ws" : "wss"
@@ -328,6 +371,10 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         guard task === webSocketTask else { return }
+        if closeCode.rawValue == 4003 {
+            requestFreshAccessToken("Refreshing expired cloud session…")
+            return
+        }
         handleSocketFailure(webSocketTask, status: "Live cloud reconnecting…")
     }
 }

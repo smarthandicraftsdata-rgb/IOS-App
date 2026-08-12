@@ -1,32 +1,18 @@
-# SH Lamp iOS 1.7.6 — R21A RF5.2 Route Recovery
+# SH Lamp iOS 1.7.9 (21) — RF5.3 Cloud Slider Stability
 
-Build: **1.7.6 (18)**  
-Base: **RF5.1 remembered-brightness fix + RF5 universal ordered transport**
+This build is based directly on RF5.2.2 Token Recovery and therefore retains:
+- RF5.2 Local Wi-Fi route recovery,
+- RF5.2.1 LAN/BLE self-healing connection supervisor,
+- RF5.2.2 JWT refresh before /ws/app reconnect,
+- RF5 ordered cross-transport commands and semantic ACK handling.
 
-## Why RF5.2 exists
+## RF5.3 change
 
-The extended physical test/video showed the app reporting **Offline** while the ESP was still connected to router Wi-Fi/cloud and, later, while the ESP logged a connected local realtime client. This exposed stale RF2-era route-health rules in the iOS app rather than a loss of ESP connectivity.
+The physical test showed a reproducible trigger: while Remote/Cloud control was healthy, dragging brightness rapidly produced a burst of ordered `setOutputState` frames and was immediately followed by ESP device-WebSocket disconnects while router Wi-Fi remained associated.
 
-## RF5.2 corrections
+RF5.3 reduces only intermediate Cloud slider traffic:
+- BLE/LAN streaming remains 100 ms (10 Hz).
+- Cloud streaming is coalesced to 250 ms (4 Hz).
+- Slider release still sends one immediate durable ordered command and waits for the ESP semantic ACK.
 
-- A validated RF5 protocol-v3 local WebSocket is now sufficient proof of Local Wi-Fi reachability.
-- The app no longer requires a separate HTTP `/api/status` success before promoting LAN when the v3 realtime socket is healthy.
-- Remote/Cloud remains usable through RF5's REST + semantic-ACK fallback while the iPhone account WebSocket is rebinding.
-- Route badges are rebuilt immediately when the app cloud socket connects/disconnects.
-- Backend device-online state is reconciled by REST after phone network-interface changes.
-- App cloud WebSocket authentication has a 6-second timeout/reconnect guard.
-- A 12-second Wi-Fi attachment grace prevents transient path-change misses from erasing the remembered local host.
-- RF5.1 remembered-brightness alias/BLE correction is retained.
-- RF5 ordered command/sequence logic is retained.
-
-## Compatibility
-
-This iOS build works with the **RF5 firmware already flashed**. The RF5.1 firmware remains recommended separately because it fixes the saved-brightness 4% → 20% issue. No Render backend change is required for RF5.2.
-
-## Physical test order
-
-1. BLE ON/OFF.
-2. Turn Bluetooth off while phone Wi-Fi stays on. Expect Local Wi-Fi quickly, not Offline.
-3. Turn phone Wi-Fi off with cellular on. Expect Cloud/Remote and working ON/OFF.
-4. Turn phone Wi-Fi on again. Expect Local Wi-Fi to return without a long Offline period.
-5. Repeat rapidly and after a long idle.
+Use together with the RF5.3 Render backend and RF5.3 ESP firmware. The backend/firmware add the `ephemeral: true` live-slider contract; running this app with older backend/firmware is safe but does not receive the full traffic reduction.

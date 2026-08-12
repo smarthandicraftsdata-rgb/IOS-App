@@ -1,21 +1,6 @@
-SH Lamp RF5.2 iOS Route Recovery Manifest
-Date: 2026-08-12
-iOS version: 1.7.6 (build 18)
-Base: RF5.1 iOS 1.7.5 (17)
-Target firmware: RF5 or RF5.1 protocol-v3 firmware
-Backend: RF5 backend unchanged
-
-Changed iOS production source:
-- iosApp/SHLAMP/AppViewModel.swift
-- iosApp/SHLAMP/CloudRealtimeClient.swift
-- iosApp/SHLAMP/CloudAPI.swift (User-Agent/version only)
-- iosApp/SHLAMP/LocalLampController.swift (User-Agent/version only)
-- iosApp/SHLAMP.xcodeproj/project.pbxproj (1.7.6 / build 18)
-
-Route-recovery behavior:
-- local v3 realtime socket can directly establish LAN health
-- cloud REST semantic-ACK fallback remains usable during app WS rebind
-- immediate route rebuild on cloud socket status
-- bounded REST dashboard reconciliation on interface changes
-- 6 s cloud auth timeout
-- 12 s Wi-Fi attachment host-retention grace
+SH Lamp iOS RF5.3 Cloud Slider Stability
+Version: 1.7.9
+Build: 21
+Baseline: iOS 1.7.8 build 20 RF5.2.2 Token Recovery
+Primary RF5.3 code change: iosApp/SHLAMP/AppViewModel.swift
+Supporting version headers: CloudRealtimeClient.swift, CloudAPI.swift, LocalLampController.swift, project.pbxproj

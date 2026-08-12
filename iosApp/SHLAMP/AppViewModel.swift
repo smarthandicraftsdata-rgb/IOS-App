@@ -164,6 +164,7 @@ final class AppViewModel: ObservableObject {
     private var wifiPathAvailable = false
     private var wifiAttachedAt: Date?
     private var cloudReconcileTask: Task<Void, Never>?
+    private var cloudSessionRefreshTask: Task<CloudSession, Error>?
     private var wifiConfirmedAt: [String: Date] = [:]
     private var localStateReceivedAt: [String: Date] = [:]
     private var bleStateReceivedAt: [String: Date] = [:]
@@ -175,6 +176,9 @@ final class AppViewModel: ObservableObject {
     private var localPollTask: Task<Void, Never>?
     private var localPollInFlight: Set<String> = []
     private var localPollCursor = 0
+    private var connectionRecoveryTask: Task<Void, Never>?
+    private var lastBLERecoveryAttemptAt = Date.distantPast
+    private var lastLocalDiscoveryRefreshAt = Date.distantPast
     private var focusedLampCanonicalID: String?
     private var liveClockTask: Task<Void, Never>?
     private var brightnessStreamTasks: [String: Task<Void, Never>] = [:]
@@ -204,6 +208,9 @@ final class AppViewModel: ObservableObject {
     private let wifiHealthTTL: TimeInterval = 7
     private let wifiTransitionGrace: TimeInterval = 12
     private let localPollInterval: Duration = .seconds(2)
+    private let connectionRecoveryInterval: Duration = .seconds(2)
+    private let localDiscoveryRecoveryCadence: TimeInterval = 8
+    private let bleRecoveryCadence: TimeInterval = 4
 
     init() {
         restoreLocalRecords()
@@ -213,6 +220,7 @@ final class AppViewModel: ObservableObject {
         startNetworkMonitor()
         startLiveClock()
         startLocalStatusPolling()
+        startConnectionRecoverySupervisor()
         rebuildLamps()
         Task { await bootstrap() }
     }
@@ -319,6 +327,8 @@ final class AppViewModel: ObservableObject {
     func signOut(message: String = "Signed out.") {
         cloudReconcileTask?.cancel()
         cloudReconcileTask = nil
+        cloudSessionRefreshTask?.cancel()
+        cloudSessionRefreshTask = nil
         realtime.stop()
         local.stopDiscovery()
         ble.disconnect()
@@ -656,22 +666,28 @@ final class AppViewModel: ObservableObject {
             while !Task.isCancelled {
                 guard let pending = self.pendingStreamingOutputIntents.removeValue(forKey: key) else { break }
                 guard self.isCurrentControlIntent(pending.generation, for: lamp, field: "output") else { continue }
-                await self.sendStreamingOrderedIntent(lamp: lamp, intent: pending.intent, generation: pending.generation)
-                try? await Task.sleep(for: .milliseconds(100))
+                let usedRoute = await self.sendStreamingOrderedIntent(lamp: lamp, intent: pending.intent, generation: pending.generation)
+                // RF5.3: Cloud slider traffic crosses TLS + Render + the ESP device
+                // socket. Four live frames/second is visually smooth while avoiding
+                // the burst that previously destabilized the device WebSocket. LAN
+                // and BLE keep the original 10 Hz responsiveness. The release value
+                // is still sent immediately by setBrightness() as a durable command.
+                let frameDelayMs = usedRoute == .cloud ? 250 : 100
+                try? await Task.sleep(for: .milliseconds(frameDelayMs))
             }
         }
     }
 
-    private func sendStreamingOrderedIntent(lamp: LampRecord, intent: OrderedControlIntent, generation: Int) async {
+    private func sendStreamingOrderedIntent(lamp: LampRecord, intent: OrderedControlIntent, generation: Int) async -> LampConnectionRoute? {
         let order = routeOrder(for: lamp)
         for route in order {
-            guard isCurrentControlIntent(generation, for: lamp, field: "output") else { return }
+            guard isCurrentControlIntent(generation, for: lamp, field: "output") else { return nil }
             switch route {
             case .wifi:
                 guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
                 do {
                     _ = try await local.sendOrderedCommand(host: host, intent: intent, waitForAck: false)
-                    return
+                    return .wifi
                 } catch {
                     markWiFiFailure(for: lamp)
                 }
@@ -679,7 +695,7 @@ final class AppViewModel: ObservableObject {
                 guard canUseBLE(lamp) else { continue }
                 do {
                     try await ble.sendOrdered(intent: intent, waitForAck: false)
-                    return
+                    return .bluetooth
                 } catch { continue }
             case .cloud:
                 // Intermediate slider frames are intentionally live-only. If
@@ -694,12 +710,13 @@ final class AppViewModel: ObservableObject {
                         live: true,
                         commandID: intent.commandID
                     )
-                    return
+                    return .cloud
                 } catch { continue }
             case .offline:
                 continue
             }
         }
+        return nil
     }
 
     func setPowerMode(_ lamp: LampRecord, mode: LampPowerMode) {
@@ -1097,11 +1114,18 @@ final class AppViewModel: ObservableObject {
         let failures = (localFailureCounts[key] ?? 0) + 1
         localFailureCounts[key] = failures
         updateLocalRecord(for: lamp) { record in
-            // Keep a remembered host through short network interruptions; only
-            // discard it after repeated failures so Bonjour can recover without
-            // forcing a full setup flow.
-            if failures >= 3 { record.localHost = nil }
-            record.route = self.canUseBLE(lamp) ? .bluetooth : .offline
+            // RF5.2.1: a remembered host is identity/recovery metadata, not a
+            // liveness bit. Never erase it merely because transient LAN probes
+            // failed; doing so stopped all future direct recovery while the
+            // iPhone and ESP were still on the same Wi-Fi.
+            _ = failures
+            record.route = self.selectedRoute(
+                for: record,
+                local: record,
+                cloud: record.cloudLampId.flatMap { cloudID in
+                    self.dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+                }
+            )
             record.online = record.route != .offline
         }
     }
@@ -1205,12 +1229,86 @@ final class AppViewModel: ObservableObject {
             rebuildLamps()
             return
         }
-        record.localHost = nil
-        record.route = canUseBLE(record) ? .bluetooth : .offline
+
+        // RF5.2.1: keep the last-known hostname/IP indefinitely. It is needed
+        // by the recovery supervisor to reopen the protocol-v3 socket even
+        // after Bonjour or an HTTP probe temporarily misses the lamp.
+        record.route = selectedRoute(
+            for: record,
+            local: record,
+            cloud: record.cloudLampId.flatMap { cloudID in
+                dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+            }
+        )
         record.online = record.route != .offline
         localRecords[key] = record
         persistLocalRecords()
         rebuildLamps()
+    }
+
+    private func startConnectionRecoverySupervisor() {
+        connectionRecoveryTask?.cancel()
+        connectionRecoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if !self.manualAddFlowActive {
+                    self.recoverOfflineConnections()
+                }
+                try? await Task.sleep(for: self.connectionRecoveryInterval)
+            }
+        }
+    }
+
+    private func recoverOfflineConnections(now: Date = Date()) {
+        let localCandidates = localRecords.values
+            .filter { $0.routePreference != .remote }
+            .sorted { $0.canonicalID < $1.canonicalID }
+
+        // LAN recovery is independent of Cloud. When the phone and lamp are on
+        // the same Wi-Fi, keep reopening the known protocol-v3 endpoint and
+        // periodically refresh Bonjour even if Render is completely offline.
+        if wifiPathAvailable {
+            for record in localCandidates.prefix(2) {
+                guard let host = record.localHost, !isWiFiHealthy(record, now: now) else { continue }
+                local.recoverRealtime(host: host)
+            }
+
+            if localCandidates.contains(where: { !isWiFiHealthy($0, now: now) }),
+               now.timeIntervalSince(lastLocalDiscoveryRefreshAt) >= localDiscoveryRecoveryCadence {
+                lastLocalDiscoveryRefreshAt = now
+                local.restartDiscovery()
+            }
+        }
+
+        guard ble.isBluetoothPoweredOn else { return }
+
+        let focusedRecord = focusedLampCanonicalID.flatMap { focused in
+            localCandidates.first(where: { $0.canonicalID.uppercased() == focused })
+        }
+        let target: LampRecord?
+        if let focusedRecord, !canUseBLE(focusedRecord) {
+            target = focusedRecord
+        } else if !ble.isReady {
+            target = localCandidates.first(where: { !canUseBLE($0) })
+        } else {
+            target = nil
+        }
+
+        guard let target, !ble.isConnecting,
+              now.timeIntervalSince(lastBLERecoveryAttemptAt) >= bleRecoveryCadence else { return }
+        lastBLERecoveryAttemptAt = now
+
+        // CoreBluetooth can reconnect a known UUID directly even when the
+        // 10-second scan window missed its advertisement. If no identifier has
+        // been learned yet, restart scanning. This makes BLE self-healing
+        // instead of depending on one onAppear scan.
+        if let peripheralID = target.bleIdentifier {
+            pendingAutoConnectPeripheralID = peripheralID
+            ble.connect(to: peripheralID)
+        } else {
+            pendingAutoConnectPeripheralID = nil
+            ble.startScan()
+        }
     }
 
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
@@ -1509,7 +1607,11 @@ final class AppViewModel: ObservableObject {
                             }
                         }
                     }
-                    self.local.startDiscovery()
+                    // Force a fresh Bonjour generation on every Wi-Fi
+                    // attachment. startDiscovery() alone is a no-op when the
+                    // browser is already marked running and can leave a stale
+                    // discoveredHosts cache blocking recovery.
+                    self.local.restartDiscovery()
                 } else {
                     self.wifiAttachedAt = nil
                     self.local.stopDiscovery()
@@ -1579,15 +1681,45 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func refreshCloudSession() async throws -> CloudSession {
+        if let existing = cloudSessionRefreshTask {
+            return try await existing.value
+        }
+        guard session != nil else { throw AppError.unauthorized }
+
+        let task = Task { @MainActor [weak self] () throws -> CloudSession in
+            guard let self, let current = self.session else { throw AppError.unauthorized }
+            let refreshed = try await self.api.refresh(refreshToken: current.refreshToken)
+            try self.keychain.save(refreshed)
+            self.session = refreshed
+
+            // Access tokens are deliberately short-lived. A REST refresh must
+            // also rotate the account WebSocket immediately; otherwise the
+            // realtime client can keep reconnecting forever with the old JWT.
+            self.realtime.start(
+                token: refreshed.accessToken,
+                homeID: self.dashboard.homes.first?.id ?? "default",
+                force: true
+            )
+            return refreshed
+        }
+        cloudSessionRefreshTask = task
+        do {
+            let refreshed = try await task.value
+            cloudSessionRefreshTask = nil
+            return refreshed
+        } catch {
+            cloudSessionRefreshTask = nil
+            throw error
+        }
+    }
+
     private func withAccessToken<T>(_ operation: (String) async throws -> T) async throws -> T {
-        guard var current = session else { throw AppError.unauthorized }
+        guard let current = session else { throw AppError.unauthorized }
         do { return try await operation(current.accessToken) }
         catch AppError.unauthorized {
-            let refreshed = try await api.refresh(refreshToken: current.refreshToken)
-            try keychain.save(refreshed)
-            session = refreshed
-            current = refreshed
-            return try await operation(current.accessToken)
+            let refreshed = try await refreshCloudSession()
+            return try await operation(refreshed.accessToken)
         }
     }
 
@@ -2384,6 +2516,22 @@ extension AppViewModel: CloudRealtimeClientDelegate {
             // in-memory ACK correlation entries so they cannot leak.
             pendingCloudMutationCommands.removeAll()
             latestCloudMutationCommandByLampID.removeAll()
+        }
+    }
+
+    func realtimeClientNeedsAccessTokenRefresh(_ client: CloudRealtimeClient) {
+        guard session != nil else { return }
+        cloudConnected = false
+        cloudStatus = "Refreshing cloud session…"
+        rebuildLamps()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.refreshCloudSession()
+            } catch {
+                self.signOut(message: "Your sign-in expired. Please sign in again.")
+            }
         }
     }
 
