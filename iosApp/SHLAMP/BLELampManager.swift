@@ -67,6 +67,11 @@ final class BLELampManager: NSObject {
     private var connectionSetupCompleted = false
     private var scanStopWorkItem: DispatchWorkItem?
     private var lastStatusRequestAt = Date.distantPast
+    // RF5 ordered ACKs are touched by app tasks and CoreBluetooth callbacks.
+    // Keep continuation ownership serialized so a timeout/disconnect/ACK race
+    // can never resume the same CheckedContinuation twice.
+    private let orderedAckLock = NSLock()
+    private var orderedAckWaiters: [String: (continuation: CheckedContinuation<Void, Error>, timeout: Task<Void, Never>)] = [:]
 
     private var savedExpectedCount = 0
     private var savedAssemblies: [Int: TextAssembly] = [:]
@@ -125,6 +130,137 @@ final class BLELampManager: NSObject {
     func brightness(_ percent: Int) { writeControl([0x02, UInt8(clamp(percent, 0...100))], coalesceBrightness: true) }
     func fade(_ mode: Int) { writeControl([0x03, UInt8(clamp(mode, 0...3))]) }
     func timer(_ minutes: Int) { writeControl([0x04, UInt8([0, 15, 30, 60].contains(minutes) ? minutes : 0)]) }
+
+    /// RF5 compact ordered command. The 20-byte frame fits the default ATT
+    /// payload and carries the same controller/session/intent identity used by
+    /// LAN and cloud. `commandID` is deterministically derived by the app from
+    /// those fields, so the BLE frame does not need to carry a long UUID.
+    func sendOrdered(intent: OrderedControlIntent, waitForAck: Bool) async throws {
+        guard let characteristic = controlCharacteristic else {
+            throw AppError.message("The lamp Bluetooth control is not ready.")
+        }
+        let packet = try orderedPacket(intent)
+        let key = orderedAckKey(intent)
+
+        if !waitForAck {
+            if intent.kind == .output {
+                writeQueue.removeAll { request in
+                    request.characteristic.uuid == characteristic.uuid &&
+                    request.data.count >= 2 && request.data[0] == 0x60 && request.data[1] == OrderedIntentKind.output.rawValue
+                }
+            }
+            enqueue(characteristic: characteristic, data: packet, coalesceBrightness: false)
+            return
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            let timeout = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1.3))
+                guard !Task.isCancelled, let self else { return }
+                self.failOrderedAck(key: key, error: AppError.message("The lamp did not acknowledge the Bluetooth command."))
+            }
+
+            orderedAckLock.lock()
+            let replaced = orderedAckWaiters.updateValue((continuation, timeout), forKey: key)
+            orderedAckLock.unlock()
+            if let replaced {
+                replaced.timeout.cancel()
+                replaced.continuation.resume(throwing: AppError.message("A newer Bluetooth attempt replaced the same ordered command."))
+            }
+            enqueue(characteristic: characteristic, data: packet, coalesceBrightness: false)
+        }
+    }
+
+    private func orderedPacket(_ intent: OrderedControlIntent) throws -> Data {
+        let hex = intent.controllerID.uppercased()
+        guard hex.range(of: "^[0-9A-F]{12}$", options: .regularExpression) != nil else {
+            throw AppError.message("Invalid controller identity.")
+        }
+        var bytes = [UInt8](repeating: 0, count: 20)
+        bytes[0] = 0x60
+        bytes[1] = intent.kind.rawValue
+        for index in 0..<6 {
+            let start = hex.index(hex.startIndex, offsetBy: index * 2)
+            let end = hex.index(start, offsetBy: 2)
+            bytes[2 + index] = UInt8(hex[start..<end], radix: 16) ?? 0
+        }
+        writeUInt32BE(intent.controllerSession, into: &bytes, offset: 8)
+        writeUInt32BE(intent.intentSequence, into: &bytes, offset: 12)
+
+        switch intent.kind {
+        case .output:
+            bytes[16] = UInt8(clamp(intent.value["brightness"] as? Int ?? 0, 0...100))
+            bytes[17] = UInt8(clamp(intent.value["rememberedBrightness"] as? Int ?? 20, 1...100))
+            bytes[18] = (intent.value["power"] as? Bool) == true ? 0x01 : 0x00
+        case .fade:
+            bytes[16] = UInt8(clamp(intent.value["fadeMode"] as? Int ?? 0, 0...3))
+        case .timer:
+            let minutes = intent.value["timerMinutes"] as? Int ?? 0
+            bytes[16] = UInt8([0, 15, 30, 60].contains(minutes) ? minutes : 0)
+        }
+        bytes[19] = crc8(bytes[0..<19])
+        return Data(bytes)
+    }
+
+    private func orderedAckKey(_ intent: OrderedControlIntent) -> String {
+        "\(intent.controllerID)|\(intent.controllerSession)|\(intent.intentSequence)|\(intent.kind.rawValue)"
+    }
+
+    private func orderedAckKey(controllerID: String, session: UInt32, sequence: UInt32, kind: UInt8) -> String {
+        "\(controllerID)|\(session)|\(sequence)|\(kind)"
+    }
+
+    private func writeUInt32BE(_ value: UInt32, into bytes: inout [UInt8], offset: Int) {
+        bytes[offset] = UInt8((value >> 24) & 0xFF)
+        bytes[offset + 1] = UInt8((value >> 16) & 0xFF)
+        bytes[offset + 2] = UInt8((value >> 8) & 0xFF)
+        bytes[offset + 3] = UInt8(value & 0xFF)
+    }
+
+    private func readUInt32BE(_ bytes: [UInt8], offset: Int) -> UInt32 {
+        (UInt32(bytes[offset]) << 24) | (UInt32(bytes[offset + 1]) << 16) |
+        (UInt32(bytes[offset + 2]) << 8) | UInt32(bytes[offset + 3])
+    }
+
+    private func crc8<C: Collection>(_ bytes: C) -> UInt8 where C.Element == UInt8 {
+        bytes.reduce(UInt8(0xA7)) { partial, byte in partial ^ byte }
+    }
+
+    private func parseOrderedAck(_ data: Data) -> Bool {
+        let bytes = [UInt8](data)
+        guard bytes.count == 20, bytes[0] == 0x61, crc8(bytes[0..<19]) == bytes[19] else { return false }
+        let controllerID = bytes[2..<8].map { String(format: "%02X", $0) }.joined()
+        let session = readUInt32BE(bytes, offset: 8)
+        let sequence = readUInt32BE(bytes, offset: 12)
+        let key = orderedAckKey(controllerID: controllerID, session: session, sequence: sequence, kind: bytes[1])
+        let status = bytes[16]
+        if status <= 2 {
+            resolveOrderedAck(key: key)
+        } else {
+            failOrderedAck(key: key, error: AppError.message("The lamp rejected the ordered Bluetooth command."))
+        }
+        return true
+    }
+
+    private func takeOrderedAckWaiter(key: String) -> (continuation: CheckedContinuation<Void, Error>, timeout: Task<Void, Never>)? {
+        orderedAckLock.lock()
+        let waiter = orderedAckWaiters.removeValue(forKey: key)
+        orderedAckLock.unlock()
+        return waiter
+    }
+
+    private func resolveOrderedAck(key: String) {
+        guard let waiter = takeOrderedAckWaiter(key: key) else { return }
+        waiter.timeout.cancel()
+        waiter.continuation.resume(returning: ())
+    }
+
+    private func failOrderedAck(key: String, error: Error) {
+        guard let waiter = takeOrderedAckWaiter(key: key) else { return }
+        waiter.timeout.cancel()
+        waiter.continuation.resume(throwing: error)
+    }
+
     func identify() { writeControl([0x07]) }
     func requestStatus(force: Bool = false) {
         let now = Date()
@@ -241,6 +377,14 @@ final class BLELampManager: NSObject {
         batteryCharacteristic = nil
         writeQueue.removeAll()
         writeInProgress = false
+        orderedAckLock.lock()
+        let orderedWaiters = Array(orderedAckWaiters.values)
+        orderedAckWaiters.removeAll()
+        orderedAckLock.unlock()
+        orderedWaiters.forEach { item in
+            item.timeout.cancel()
+            item.continuation.resume(throwing: AppError.message("Bluetooth disconnected before command acknowledgement."))
+        }
         initialStateRequested = false
         connectionSetupCompleted = false
         lastStatusRequestAt = .distantPast
@@ -282,6 +426,7 @@ final class BLELampManager: NSObject {
     }
 
     private func parseControlStatus(_ data: Data) {
+        if parseOrderedAck(data) { return }
         guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               let regex = try? NSRegularExpression(pattern: "^P([01])B(\\d{3})C(\\d{3})F([0-3])T(\\d{5})$"),
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)),
@@ -417,20 +562,35 @@ extension BLELampManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // Switching A -> B can leave a late callback for A in CoreBluetooth's
+        // queue. Never let that callback mutate B's connection state.
+        guard self.peripheral?.identifier == peripheral.identifier else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         publishStatus("Reading lamp services…")
         peripheral.discoverServices([serviceUUID, batteryServiceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        let id = peripheral.identifier
+        guard self.peripheral?.identifier == id else { return }
         publishError(error?.localizedDescription ?? "Bluetooth connection failed.")
         clearConnection(keepPeripheral: false)
+        Task { @MainActor in delegate?.bleManager(self, didDisconnect: id) }
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         let id = peripheral.identifier
-        clearConnection(keepPeripheral: false)
+        let wasCurrent = self.peripheral?.identifier == id
+        if wasCurrent {
+            clearConnection(keepPeripheral: false)
+            publishStatus(error == nil ? "Bluetooth disconnected." : "Bluetooth connection was lost.")
+        }
+        // Always identify the disconnected physical lamp so its route can be
+        // refreshed; AppViewModel preserves a replacement connection if one
+        // has already been selected.
         Task { @MainActor in delegate?.bleManager(self, didDisconnect: id) }
-        publishStatus(error == nil ? "Bluetooth disconnected." : "Bluetooth connection was lost.")
     }
 }
 

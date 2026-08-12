@@ -24,6 +24,8 @@ final class LocalLampController: NSObject {
     private var realtimeValidatedHosts: Set<String> = []
     private var realtimeHeartbeatTasks: [String: Task<Void, Never>] = [:]
     private var realtimeReconnectTasks: [String: Task<Void, Never>] = [:]
+    private var realtimeHostByLampID: [String: String] = [:]
+    private var realtimeAckWaiters: [String: (continuation: CheckedContinuation<JSONObject, Error>, timeout: Task<Void, Never>)] = [:]
 
     override init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -54,7 +56,7 @@ final class LocalLampController: NSObject {
     // MARK: - R21A local realtime
 
     func startRealtime(host: String) {
-        let clean = normalizedHost(host)
+        let clean = normalizedRealtimeHost(host)
         guard !clean.isEmpty else { return }
 
         realtimeLock.lock()
@@ -84,13 +86,14 @@ final class LocalLampController: NSObject {
     }
 
     func stopRealtime(host: String) {
-        let clean = normalizedHost(host)
+        let clean = normalizedRealtimeHost(host)
         realtimeLock.lock()
         let socket = realtimeTasks.removeValue(forKey: clean)
         realtimeLastMessageAt.removeValue(forKey: clean)
         realtimeValidatedHosts.remove(clean)
         let heartbeat = realtimeHeartbeatTasks.removeValue(forKey: clean)
         let reconnect = realtimeReconnectTasks.removeValue(forKey: clean)
+        realtimeHostByLampID = realtimeHostByLampID.filter { $0.value != clean }
         realtimeLock.unlock()
         heartbeat?.cancel()
         reconnect?.cancel()
@@ -98,7 +101,7 @@ final class LocalLampController: NSObject {
     }
 
     func isRealtimeHealthy(host: String, now: Date = Date()) -> Bool {
-        let clean = normalizedHost(host)
+        let clean = normalizedRealtimeHost(host)
         realtimeLock.lock()
         let last = realtimeLastMessageAt[clean]
         let hasTask = realtimeTasks[clean] != nil
@@ -108,9 +111,144 @@ final class LocalLampController: NSObject {
         return now.timeIntervalSince(last) <= 16
     }
 
-    // R21A Review Fix 1 intentionally keeps this socket state/event-only.
-    // Local commands continue through the proven HTTP API until a later phase
-    // adds explicit WebSocket command ACK correlation and idempotent retry.
+    // RF5 ordered LAN mutation. Protocol v3 adds command IDs plus the same
+    // controller/session/intent sequence carried over BLE and cloud. HTTP v3
+    // remains an ordered fallback when the realtime socket is unavailable.
+    func sendOrderedCommand(
+        host: String,
+        intent: OrderedControlIntent,
+        waitForAck: Bool
+    ) async throws -> WiFiLampSnapshot? {
+        let clean = normalizedRealtimeHost(host)
+        if isRealtimeHealthy(host: clean), let socket = currentRealtimeSocket(host: clean) {
+            do {
+                if waitForAck {
+                    let ack = try await sendRealtimeOrderedAwaitingAck(host: clean, socket: socket, intent: intent)
+                    guard ack.bool("success") != false else {
+                        throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the local command."))
+                    }
+                    if let state = ack.object("state") {
+                        return try snapshot(from: state, host: normalizedHost(host))
+                    }
+                    return try await readStatus(host: host)
+                } else {
+                    try await sendRealtimeOrdered(host: clean, socket: socket, intent: intent)
+                    return nil
+                }
+            } catch {
+                // Fall through to the ordered HTTP endpoint with the exact same
+                // command ID. Device-side sequence/dedup makes this safe even
+                // if the WebSocket frame executed and only its ACK was lost.
+            }
+        }
+
+        let object = try await sendOrderedHTTP(host: host, intent: intent)
+        guard object.bool("success") != false else {
+            throw AppError.message(firstNonBlank(object.string("error"), "The lamp rejected the local command."))
+        }
+        if let state = object.object("state") {
+            return try snapshot(from: state, host: normalizedHost(host))
+        }
+        return waitForAck ? try await readStatus(host: host) : nil
+    }
+
+    private func currentRealtimeSocket(host: String) -> URLSessionWebSocketTask? {
+        realtimeLock.lock()
+        defer { realtimeLock.unlock() }
+        return realtimeTasks[normalizedRealtimeHost(host)]
+    }
+
+    private func orderedObject(_ intent: OrderedControlIntent) -> JSONObject {
+        [
+            "type": "command",
+            "protocolVersion": 3,
+            "commandId": intent.commandID,
+            "action": intent.action,
+            "value": intent.value
+        ]
+    }
+
+    private func sendRealtimeOrdered(host: String, socket: URLSessionWebSocketTask, intent: OrderedControlIntent) async throws {
+        let data = try jsonData(orderedObject(intent))
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw AppError.message("Could not encode the local command.")
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            socket.send(.string(text)) { [weak self, weak socket] error in
+                if let error {
+                    if let self, let socket { self.markRealtimeDisconnected(host: host, socket: socket) }
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    private func sendRealtimeOrderedAwaitingAck(
+        host: String,
+        socket: URLSessionWebSocketTask,
+        intent: OrderedControlIntent
+    ) async throws -> JSONObject {
+        try await withCheckedThrowingContinuation { continuation in
+            let timeout = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1.4))
+                guard !Task.isCancelled, let self else { return }
+                self.failRealtimeAck(commandID: intent.commandID, error: AppError.message("The lamp did not acknowledge the local command."))
+            }
+            realtimeLock.lock()
+            let replaced = realtimeAckWaiters.updateValue((continuation, timeout), forKey: intent.commandID)
+            realtimeLock.unlock()
+            if let replaced {
+                replaced.timeout.cancel()
+                replaced.continuation.resume(throwing: AppError.message("A newer local attempt replaced the same ordered command."))
+            }
+
+            Task { [weak self, weak socket] in
+                guard let self, let socket else { return }
+                do { try await self.sendRealtimeOrdered(host: host, socket: socket, intent: intent) }
+                catch { self.failRealtimeAck(commandID: intent.commandID, error: error) }
+            }
+        }
+    }
+
+    private func resolveRealtimeAck(_ object: JSONObject) {
+        let commandID = object.string("commandId")
+        guard !commandID.isEmpty else { return }
+        realtimeLock.lock()
+        let waiter = realtimeAckWaiters.removeValue(forKey: commandID)
+        realtimeLock.unlock()
+        waiter?.timeout.cancel()
+        waiter?.continuation.resume(returning: object)
+    }
+
+    private func failRealtimeAck(commandID: String, error: Error) {
+        realtimeLock.lock()
+        let waiter = realtimeAckWaiters.removeValue(forKey: commandID)
+        realtimeLock.unlock()
+        waiter?.timeout.cancel()
+        waiter?.continuation.resume(throwing: error)
+    }
+
+    private func sendOrderedHTTP(host: String, intent: OrderedControlIntent) async throws -> JSONObject {
+        let clean = normalizedHost(host)
+        guard !clean.isEmpty, let url = URL(string: "http://\(clean)/api/command") else {
+            throw AppError.message("Lamp address is empty or invalid.")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 3
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("SHLAMP-iOS/1.7.4-RF5", forHTTPHeaderField: "User-Agent")
+        request.httpBody = try jsonData(orderedObject(intent))
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? ""
+            throw AppError.message(text.isEmpty ? "Ordered local command failed." : text)
+        }
+        return try parseJSONObject(data)
+    }
 
     private func receiveRealtime(host: String, socket: URLSessionWebSocketTask) {
         socket.receive { [weak self, weak socket] result in
@@ -149,14 +287,42 @@ final class LocalLampController: NSObject {
         if type.caseInsensitiveCompare("state") == .orderedSame {
             stateObject = object
         } else if type.caseInsensitiveCompare("ack") == .orderedSame {
+            resolveRealtimeAck(object)
             stateObject = object.object("state")
         }
 
         guard let stateObject, let snapshot = try? snapshot(from: stateObject, host: host) else { return }
+        let lampKey = snapshot.lampId.uppercased()
+        var previousHost: String?
         realtimeLock.lock()
         realtimeValidatedHosts.insert(host)
         realtimeLastMessageAt[host] = Date()
+        if !lampKey.isEmpty {
+            previousHost = realtimeHostByLampID[lampKey]
+            realtimeHostByLampID[lampKey] = host
+        }
         realtimeLock.unlock()
+
+        // RF4: a remembered IP, Bonjour hostname and :80 alias can all point to
+        // the same ESP. Keep only one realtime socket per lamp after identity is
+        // known; the RF2 log showed multiple simultaneous clients (#0/#1/#2).
+        // Prefer the already-healthy socket rather than letting a later alias
+        // steal ownership and create IP <-> mDNS reconnect oscillation.
+        if let previousHost, previousHost != host {
+            if isRealtimeHealthy(host: previousHost) {
+                stopRealtime(host: host)
+                realtimeLock.lock()
+                realtimeHostByLampID[lampKey] = previousHost
+                realtimeLock.unlock()
+                return
+            }
+
+            stopRealtime(host: previousHost)
+            realtimeLock.lock()
+            realtimeHostByLampID[lampKey] = host
+            realtimeLock.unlock()
+        }
+
         Task { @MainActor in
             delegate?.localController(self, didReceiveRealtime: snapshot)
         }
@@ -245,14 +411,21 @@ final class LocalLampController: NSObject {
         realtimeValidatedHosts.removeAll()
         realtimeHeartbeatTasks.removeAll()
         realtimeReconnectTasks.removeAll()
+        realtimeHostByLampID.removeAll()
+        let waiters = Array(realtimeAckWaiters.values)
+        realtimeAckWaiters.removeAll()
         realtimeLock.unlock()
+        waiters.forEach { item in
+            item.timeout.cancel()
+            item.continuation.resume(throwing: AppError.message("Local realtime connection closed."))
+        }
         heartbeats.forEach { $0.cancel() }
         reconnects.forEach { $0.cancel() }
         sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
     }
 
     private func realtimeURL(host: String) -> URL? {
-        let clean = normalizedHost(host)
+        let clean = normalizedRealtimeHost(host)
         guard !clean.isEmpty else { return nil }
         let baseHost: String
         if let colon = clean.lastIndex(of: ":"), clean[clean.index(after: colon)...].allSatisfy({ $0.isNumber }) {
@@ -347,7 +520,7 @@ final class LocalLampController: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.7.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.4-RF5", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? ""
@@ -399,6 +572,16 @@ final class LocalLampController: NSObject {
         snapshot.stateBootSequence = json.int("bootSequence", "stateBootSequence").map { Int64($0) }
         snapshot.stateRevision = json.int("stateRevision", "revision").map { Int64($0) }
         return snapshot
+    }
+
+    private func normalizedRealtimeHost(_ raw: String) -> String {
+        var value = normalizedHost(raw).lowercased()
+        while value.hasSuffix(".") { value.removeLast() }
+        if let colon = value.lastIndex(of: ":"),
+           value[value.index(after: colon)...] == "80" {
+            value = String(value[..<colon])
+        }
+        return value
     }
 
     private func normalizedHost(_ raw: String) -> String {

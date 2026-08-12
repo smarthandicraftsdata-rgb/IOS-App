@@ -236,6 +236,70 @@ final class CloudAPI {
         throw AppError.message(lastError)
     }
 
+    /// RF5 REST fallback with semantic ACK verification. HTTP 202 only means
+    /// Render accepted/queued the command; this method polls the command status
+    /// endpoint until the ESP ACKs, rejects, or the bounded control TTL expires.
+    func sendCommandAndWaitForAck(
+        accessToken: String,
+        lampId: String,
+        action: String,
+        value: JSONObject,
+        commandID: String,
+        timeout: TimeInterval
+    ) async throws -> JSONObject {
+        let id = lampId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? lampId
+        let encodedCommandID = commandID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? commandID
+        let body: JSONObject = [
+            "commandId": commandID,
+            "action": action,
+            "value": value
+        ]
+        let submit = try await request(
+            method: "POST",
+            path: "/api/devices/\(id)/commands",
+            body: body,
+            token: accessToken,
+            acceptErrors: true
+        )
+        if submit.status == 401 || submit.status == 403 { throw AppError.unauthorized }
+        guard (200...299).contains(submit.status) else { throw try error(from: submit) }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var delay: Duration = .milliseconds(90)
+        while Date() < deadline {
+            if !Task.isCancelled { try? await Task.sleep(for: delay) }
+            let result = try await request(
+                method: "GET",
+                path: "/api/devices/\(id)/commands/\(encodedCommandID)",
+                token: accessToken,
+                acceptErrors: true
+            )
+            if result.status == 401 || result.status == 403 { throw AppError.unauthorized }
+            if result.status == 404 {
+                delay = .milliseconds(140)
+                continue
+            }
+            guard (200...299).contains(result.status) else { throw try error(from: result) }
+            let root = try parseJSONObject(result.data)
+            let status = root.string("status").uppercased()
+            if status == "ACKNOWLEDGED" {
+                var ack = root
+                ack["type"] = "ack"
+                ack["success"] = true
+                return ack
+            }
+            if status == "FAILED" || status == "EXPIRED" {
+                var ack = root
+                ack["type"] = "ack"
+                ack["success"] = false
+                if ack.string("error").isEmpty { ack["error"] = firstNonBlank(root.string("errorMessage"), "The cloud command did not complete.") }
+                return ack
+            }
+            delay = .milliseconds(140)
+        }
+        throw AppError.message("The lamp did not acknowledge the REST cloud command in time.")
+    }
+
     private func request(method: String, path: String, body: JSONObject? = nil, token: String? = nil, acceptErrors: Bool = false) async throws -> HTTPResult {
         guard let url = URL(string: path, relativeTo: baseURL) else { throw AppError.message("Invalid cloud URL.") }
         var request = URLRequest(url: url)
@@ -243,7 +307,7 @@ final class CloudAPI {
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.setValue("SHLAMP-iOS/1.7.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.4-RF5", forHTTPHeaderField: "User-Agent")
         if let token, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body { request.httpBody = try jsonData(body) }
         let (data, response) = try await session.data(for: request)
@@ -357,9 +421,17 @@ final class CloudAPI {
         let stateBootId = [stateJSON.int("bootId", "stateBootId"), rawJSON.int("bootId", "stateBootId"), json.int("bootId", "stateBootId")].compactMap { $0 }.first.map { Int64($0) }
         let stateBootSequence = [stateJSON.int("bootSequence", "stateBootSequence"), rawJSON.int("bootSequence", "stateBootSequence"), json.int("bootSequence", "stateBootSequence")].compactMap { $0 }.first.map { Int64($0) }
         let stateRevision = [stateJSON.int("stateRevision", "revision"), rawJSON.int("stateRevision", "revision"), json.int("stateRevision", "revision")].compactMap { $0 }.first.map { Int64($0) }
+        let rememberedBrightness = clamp(
+            stateJSON.int("rememberedBrightness", "lastBrightness")
+                ?? rawJSON.int("rememberedBrightness", "lastBrightness")
+                ?? json.int("rememberedBrightness", "lastBrightness")
+                ?? max(brightness, 20),
+            1...100
+        )
         let state = LampState(
             power: power,
             brightness: brightness,
+            rememberedBrightness: rememberedBrightness,
             fadeMode: clamp(stateJSON.int("fadeMode", "fade") ?? json.int("fadeMode") ?? 2, 0...3),
             timerRemainingSeconds: adjustedTimer,
             batteryValid: batteryValid,

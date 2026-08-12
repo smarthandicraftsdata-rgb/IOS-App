@@ -105,6 +105,7 @@ struct CloudHome: Identifiable, Codable, Equatable {
 struct LampState: Codable, Equatable {
     var power = false
     var brightness = 0
+    var rememberedBrightness = 20
     var fadeMode = 2
     var timerRemainingSeconds: Int64 = 0
     var batteryValid = false
@@ -120,7 +121,7 @@ struct LampState: Codable, Equatable {
     var stateRevision: Int64? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case power, brightness, fadeMode, timerRemainingSeconds
+        case power, brightness, rememberedBrightness, fadeMode, timerRemainingSeconds
         case batteryValid, batteryPercent, batteryVoltageMv, batteryCharging
         case powerMode, runtimeState, stateBootId, stateBootSequence, stateRevision
     }
@@ -128,6 +129,7 @@ struct LampState: Codable, Equatable {
     init(
         power: Bool = false,
         brightness: Int = 0,
+        rememberedBrightness: Int = 20,
         fadeMode: Int = 2,
         timerRemainingSeconds: Int64 = 0,
         batteryValid: Bool = false,
@@ -142,6 +144,7 @@ struct LampState: Codable, Equatable {
     ) {
         self.power = power
         self.brightness = brightness
+        self.rememberedBrightness = max(1, min(100, rememberedBrightness))
         self.fadeMode = fadeMode
         self.timerRemainingSeconds = timerRemainingSeconds
         self.batteryValid = batteryValid
@@ -159,6 +162,7 @@ struct LampState: Codable, Equatable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         power = try values.decodeIfPresent(Bool.self, forKey: .power) ?? false
         brightness = try values.decodeIfPresent(Int.self, forKey: .brightness) ?? 0
+        rememberedBrightness = max(1, min(100, try values.decodeIfPresent(Int.self, forKey: .rememberedBrightness) ?? max(brightness, 20)))
         fadeMode = try values.decodeIfPresent(Int.self, forKey: .fadeMode) ?? 2
         timerRemainingSeconds = try values.decodeIfPresent(Int64.self, forKey: .timerRemainingSeconds) ?? 0
         batteryValid = try values.decodeIfPresent(Bool.self, forKey: .batteryValid) ?? false

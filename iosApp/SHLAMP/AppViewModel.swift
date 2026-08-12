@@ -3,6 +3,121 @@ import SwiftUI
 import Network
 import UserNotifications
 
+
+enum OrderedIntentKind: UInt8 {
+    case output = 1
+    case fade = 2
+    case timer = 3
+
+    var commandSuffix: String {
+        switch self {
+        case .output: return "O"
+        case .fade: return "F"
+        case .timer: return "T"
+        }
+    }
+}
+
+struct OrderedControlIntent {
+    let controllerID: String
+    let controllerSession: UInt32
+    let intentSequence: UInt32
+    let kind: OrderedIntentKind
+    let action: String
+    let value: JSONObject
+
+    var commandID: String {
+        "RF5-\(controllerID)-\(controllerSession)-\(intentSequence)-\(kind.commandSuffix)"
+    }
+}
+
+/// RF5 command-order identity. The controller token is stable for this app
+/// installation. Sequence numbers are leased in blocks so a crash cannot
+/// reuse a number that may already be in flight, without writing UserDefaults
+/// for every slider frame.
+private final class ControllerIntentSequenceStore {
+    private let defaults = UserDefaults.standard
+    private let controllerKey = "shlamp.rf5.controller.id"
+    private let sessionKey = "shlamp.rf5.controller.session"
+    private let highWaterKey = "shlamp.rf5.intent.highwater"
+    private let leaseSize: UInt32 = 4_096
+    private let rolloverLimit: UInt32 = 2_000_000_000
+
+    private(set) var controllerID: String
+    private(set) var session: UInt32
+    private var nextSequence: UInt32
+    private var leaseEnd: UInt32
+
+    init() {
+        if let saved = defaults.string(forKey: controllerKey),
+           saved.range(of: "^[0-9A-F]{12}$", options: .regularExpression) != nil {
+            controllerID = saved
+        } else {
+            controllerID = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).uppercased()
+            defaults.set(controllerID, forKey: controllerKey)
+        }
+
+        let savedSession = defaults.integer(forKey: sessionKey)
+        if savedSession > 0 && savedSession < Int(rolloverLimit) {
+            session = UInt32(savedSession)
+        } else {
+            session = UInt32.random(in: 1...1_500_000_000)
+            defaults.set(Int(session), forKey: sessionKey)
+        }
+
+        let savedHighWater = max(0, defaults.integer(forKey: highWaterKey))
+        let start = UInt32(min(savedHighWater, Int(rolloverLimit - leaseSize - 1)))
+        nextSequence = start
+        leaseEnd = start
+        reserveLeaseIfNeeded(force: true)
+    }
+
+    func next(kind: OrderedIntentKind, action: String, valueFields: JSONObject) -> OrderedControlIntent {
+        reserveLeaseIfNeeded(force: false)
+        nextSequence &+= 1
+        if nextSequence == 0 || nextSequence >= rolloverLimit {
+            rotateSession()
+            nextSequence = 1
+        }
+
+        var value = valueFields
+        value["protocolVersion"] = 3
+        value["controllerId"] = controllerID
+        value["controllerSession"] = Int(session)
+        value["intentSequence"] = Int(nextSequence)
+        value["intentKind"] = kind.commandSuffix
+
+        return OrderedControlIntent(
+            controllerID: controllerID,
+            controllerSession: session,
+            intentSequence: nextSequence,
+            kind: kind,
+            action: action,
+            value: value
+        )
+    }
+
+    private func reserveLeaseIfNeeded(force: Bool) {
+        if !force && nextSequence < leaseEnd { return }
+        if nextSequence >= rolloverLimit - leaseSize - 1 {
+            rotateSession()
+            nextSequence = 0
+        }
+        leaseEnd = nextSequence + leaseSize
+        defaults.set(Int(leaseEnd), forKey: highWaterKey)
+        defaults.set(Int(session), forKey: sessionKey)
+        defaults.synchronize()
+    }
+
+    private func rotateSession() {
+        session = session >= rolloverLimit - 1 ? 1 : session + 1
+        leaseEnd = 0
+        defaults.set(Int(session), forKey: sessionKey)
+        defaults.set(0, forKey: highWaterKey)
+        defaults.synchronize()
+    }
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var currentUser: CloudUser?
@@ -57,10 +172,15 @@ final class AppViewModel: ObservableObject {
     private var notificationDeadlines: [String: Date] = [:]
     private var localPollTask: Task<Void, Never>?
     private var localPollInFlight: Set<String> = []
+    private var localPollCursor = 0
+    private var focusedLampCanonicalID: String?
     private var liveClockTask: Task<Void, Never>?
     private var brightnessStreamTasks: [String: Task<Void, Never>] = [:]
     private var pendingBrightnessValues: [String: Int] = [:]
     private var brightnessStreamGeneration: [String: Int] = [:]
+    private var pendingStreamingOutputIntents: [String: (intent: OrderedControlIntent, generation: Int)] = [:]
+    private var rememberedBrightnessByLamp: [String: Int] = [:]
+    private let orderedIntents = ControllerIntentSequenceStore()
 
     // Short-lived field ownership prevents an older BLE/Wi-Fi/cloud echo from
     // overwriting a control the user has just made. A matching device state
@@ -72,6 +192,12 @@ final class AppViewModel: ObservableObject {
     private var pendingTimerHolds: [String: (deadline: Date?, expiresAt: Date)] = [:]
 
     private var localFailureCounts: [String: Int] = [:]
+    // RF4: each logical control field is latest-wins inside the app.
+    private var controlIntentGenerations: [String: Int] = [:]
+    private var lastCloudMutationAt: [String: Date] = [:]
+    private var pendingCloudMutationCommands: [String: String] = [:]
+    private var latestCloudMutationCommandByLampID: [String: String] = [:]
+    private let cloudToLanFence: TimeInterval = 2.25
 
     private let wifiHealthTTL: TimeInterval = 7
     private let localPollInterval: Duration = .seconds(2)
@@ -91,6 +217,40 @@ final class AppViewModel: ObservableObject {
     var isSignedIn: Bool { currentUser != nil && session != nil }
     var selectedLamp: LampRecord? { selectedLampID.flatMap { id in lamps.first { $0.id == id || $0.canonicalID == id } } }
     var homeName: String { dashboard.homes.first?.name ?? "My Home" }
+
+    /// The control screen owns the nearby BLE route for its physical lamp.
+    /// This prevents an arbitrary previously-discovered lamp from retaining
+    /// the single iPhone BLE connection while the user is controlling another.
+    func focusLamp(_ lamp: LampRecord) {
+        selectedLampID = lamp.canonicalID
+        let focusKey = lamp.canonicalID.uppercased()
+        focusedLampCanonicalID = focusKey
+        guard lamp.routePreference != .remote, !manualAddFlowActive else { return }
+
+        // RF5: the active control screen owns the BLE route for its physical
+        // lamp. A ready connection to a different lamp must not block the
+        // focused lamp from being discovered and selected.
+        guard !canUseBLE(lamp) else { return }
+        pendingAutoConnectPeripheralID = nil
+
+        if let target = nearbyLamps.first(where: { nearby in
+            guard let record = knownRecord(for: nearby) else { return false }
+            return record.canonicalID.uppercased() == focusKey
+        }) {
+            pendingAutoConnectPeripheralID = target.id
+            ble.connect(to: target.id)
+        } else {
+            // Preserve any existing healthy link until the focused lamp is
+            // actually discovered. canUseBLE() prevents that link from being
+            // used to mutate the wrong physical lamp.
+            ble.startScan()
+        }
+    }
+
+    func clearLampFocus(_ lamp: LampRecord) {
+        if focusedLampCanonicalID == lamp.canonicalID.uppercased() { focusedLampCanonicalID = nil }
+        cancelBrightnessStream(for: lamp)
+    }
 
     func bootstrap() async {
         guard let saved = keychain.read() else { return }
@@ -327,120 +487,175 @@ final class AppViewModel: ObservableObject {
         } catch { handle(error); return nil }
     }
 
+    private func cancelBrightnessStream(for lamp: LampRecord) {
+        let key = lamp.canonicalID.uppercased()
+        brightnessStreamGeneration[key, default: 0] += 1
+        brightnessStreamTasks[key]?.cancel()
+        brightnessStreamTasks[key] = nil
+        pendingBrightnessValues.removeValue(forKey: key)
+        pendingStreamingOutputIntents.removeValue(forKey: key)
+    }
+
+    private func makeOutputIntent(_ lamp: LampRecord, power: Bool, brightness requestedBrightness: Int) -> OrderedControlIntent {
+        let key = lamp.canonicalID.uppercased()
+        let maximum = lamp.state.powerMode == .maximumBackup ? 70 : 100
+        let requested = clamp(requestedBrightness, 0...100)
+        let capped = min(requested, maximum)
+        let knownRemembered = rememberedBrightnessByLamp[key]
+            ?? max(1, min(100, lamp.state.rememberedBrightness))
+        let remembered: Int
+        let brightness: Int
+        if power {
+            brightness = max(1, capped > 0 ? capped : min(knownRemembered, maximum))
+            remembered = brightness
+        } else {
+            brightness = 0
+            remembered = max(1, min(100, capped > 0 ? capped : knownRemembered))
+        }
+        rememberedBrightnessByLamp[key] = remembered
+        return orderedIntents.next(
+            kind: .output,
+            action: "setOutputState",
+            valueFields: [
+                "power": power,
+                "brightness": brightness,
+                "rememberedBrightness": remembered
+            ]
+        )
+    }
+
     func setPower(_ lamp: LampRecord, on: Bool) {
+        cancelBrightnessStream(for: lamp)
+        let generation = nextControlIntent(for: lamp, field: "output")
+        let desiredBrightness = on ? max(lamp.state.brightness, lamp.state.rememberedBrightness) : 0
+        let ordered = makeOutputIntent(lamp, power: on, brightness: desiredBrightness)
+        let targetBrightness = ordered.value["brightness"] as? Int ?? 0
+        let remembered = ordered.value["rememberedBrightness"] as? Int ?? max(targetBrightness, 20)
+
         setPendingPower(lamp, value: on)
+        setPendingBrightness(lamp, value: targetBrightness, lifetime: 3.0)
         optimistic(lamp.id) {
             $0.state.power = on
-            if on && $0.state.brightness == 0 { $0.state.brightness = 20 }
+            $0.state.brightness = targetBrightness
+            $0.state.rememberedBrightness = remembered
         }
+
         Task {
             do {
-                try await performRouted(
+                try await performOrderedRouted(
                     lamp: lamp,
-                    localAction: { host in try await self.local.sendPower(host: host, on: on) },
-                    bleAction: { self.ble.power(on) },
-                    cloudAction: {
-                        let remoteID = try self.remoteID(for: lamp)
-                        try await self.sendCloudCommand(lampID: remoteID, action: "setPower", value: on)
-                    }
+                    intent: ordered,
+                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "output") }
                 )
             } catch { handle(error) }
         }
     }
 
     func setBrightness(_ lamp: LampRecord, value: Int) {
-        let streamKey = lamp.canonicalID.uppercased()
-        brightnessStreamGeneration[streamKey, default: 0] += 1
-        brightnessStreamTasks[streamKey]?.cancel()
-        brightnessStreamTasks[streamKey] = nil
-        pendingBrightnessValues.removeValue(forKey: streamKey)
-
+        cancelBrightnessStream(for: lamp)
+        let generation = nextControlIntent(for: lamp, field: "output")
         let requested = clamp(value, 0...100)
-        let percent = lamp.state.powerMode == .maximumBackup ? min(requested, 70) : requested
+        let maximum = lamp.state.powerMode == .maximumBackup ? 70 : 100
+        let percent = min(requested, maximum)
+        let ordered = makeOutputIntent(lamp, power: percent > 0, brightness: percent)
+        let remembered = ordered.value["rememberedBrightness"] as? Int ?? max(percent, 20)
+
+        setPendingPower(lamp, value: percent > 0)
         setPendingBrightness(lamp, value: percent, lifetime: 3.0)
         optimistic(lamp.id) {
             $0.state.brightness = percent
             $0.state.power = percent > 0
+            $0.state.rememberedBrightness = remembered
         }
         if requested != percent {
             notice = "Limited to 70% by Maximum Backup."
         }
+
         Task {
             do {
-                try await performRouted(
+                try await performOrderedRouted(
                     lamp: lamp,
-                    localAction: { host in try await self.local.sendBrightness(host: host, percent: percent) },
-                    bleAction: { self.ble.brightness(percent) },
-                    cloudAction: {
-                        let remoteID = try self.remoteID(for: lamp)
-                        try await self.sendCloudCommand(lampID: remoteID, action: "setBrightness", value: percent)
-                    }
+                    intent: ordered,
+                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "output") }
                 )
             } catch { handle(error) }
         }
     }
 
-    /// Continuous brightness control used while the slider is moving.
-    /// UI state updates immediately; transport updates are coalesced so BLE,
-    /// local HTTP and cloud are never flooded. The final slider release still
-    /// calls `setBrightness` for verified/durable confirmation.
+    /// Continuous brightness control. Every slider frame is allocated its
+    /// ordering identity at the moment the UI creates it. If OFF or a final
+    /// release happens later, its larger sequence makes every already-queued
+    /// frame stale on the ESP even if a transport delivers it late.
     func streamBrightness(_ lamp: LampRecord, value: Int) {
         let requested = clamp(value, 0...100)
-        let percent = lamp.state.powerMode == .maximumBackup ? min(requested, 70) : requested
+        let maximum = lamp.state.powerMode == .maximumBackup ? 70 : 100
+        let percent = min(requested, maximum)
+        let generation = nextControlIntent(for: lamp, field: "output")
+        let ordered = makeOutputIntent(lamp, power: percent > 0, brightness: percent)
+        let remembered = ordered.value["rememberedBrightness"] as? Int ?? max(percent, 20)
+
         setPendingBrightness(lamp, value: percent, lifetime: 1.5)
+        setPendingPower(lamp, value: percent > 0, lifetime: 1.5)
         optimistic(lamp.id) {
             $0.state.brightness = percent
             $0.state.power = percent > 0
+            $0.state.rememberedBrightness = remembered
         }
 
         let key = lamp.canonicalID.uppercased()
-        pendingBrightnessValues[key] = percent
+        pendingStreamingOutputIntents[key] = (ordered, generation)
         guard brightnessStreamTasks[key] == nil else { return }
 
-        let generation = brightnessStreamGeneration[key, default: 0] + 1
-        brightnessStreamGeneration[key] = generation
-
+        let taskGeneration = brightnessStreamGeneration[key, default: 0] + 1
+        brightnessStreamGeneration[key] = taskGeneration
         brightnessStreamTasks[key] = Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.brightnessStreamGeneration[key] == generation {
+                if self.brightnessStreamGeneration[key] == taskGeneration {
                     self.brightnessStreamTasks[key] = nil
                 }
             }
 
             while !Task.isCancelled {
-                guard let next = self.pendingBrightnessValues.removeValue(forKey: key) else { break }
-                await self.sendStreamingBrightness(lamp: lamp, percent: next)
+                guard let pending = self.pendingStreamingOutputIntents.removeValue(forKey: key) else { break }
+                guard self.isCurrentControlIntent(pending.generation, for: lamp, field: "output") else { continue }
+                await self.sendStreamingOrderedIntent(lamp: lamp, intent: pending.intent, generation: pending.generation)
                 try? await Task.sleep(for: .milliseconds(100))
             }
         }
     }
 
-    private func sendStreamingBrightness(lamp: LampRecord, percent: Int) async {
+    private func sendStreamingOrderedIntent(lamp: LampRecord, intent: OrderedControlIntent, generation: Int) async {
         let order = routeOrder(for: lamp)
         for route in order {
+            guard isCurrentControlIntent(generation, for: lamp, field: "output") else { return }
             switch route {
             case .wifi:
                 guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
-                if (try? await local.sendBrightnessFast(host: host, percent: percent)) != nil { return }
-                markWiFiFailure(for: lamp)
+                do {
+                    _ = try await local.sendOrderedCommand(host: host, intent: intent, waitForAck: false)
+                    return
+                } catch {
+                    markWiFiFailure(for: lamp)
+                }
             case .bluetooth:
                 guard canUseBLE(lamp) else { continue }
-                ble.brightness(percent)
-                return
+                do {
+                    try await ble.sendOrdered(intent: intent, waitForAck: false)
+                    return
+                } catch { continue }
             case .cloud:
-                guard cloudConnected, let remoteID = try? remoteID(for: lamp) else { continue }
+                guard isCloudHealthy(lamp), let remoteID = try? remoteID(for: lamp) else { continue }
                 do {
                     _ = try await realtime.sendCommand(
                         lampID: remoteID,
-                        action: "setBrightness",
-                        value: percent,
-                        live: true
+                        action: intent.action,
+                        value: intent.value,
+                        live: true,
+                        commandID: intent.commandID
                     )
                     return
-                } catch {
-                    continue
-                }
+                } catch { continue }
             case .offline:
                 continue
             }
@@ -448,6 +663,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func setPowerMode(_ lamp: LampRecord, mode: LampPowerMode) {
+        let intent = nextControlIntent(for: lamp, field: "powerMode")
         updateLocalRecord(for: lamp) {
             $0.state.powerMode = mode
             $0.state.runtimeState = mode == .touchOnly ? .touchOnly : .active
@@ -467,7 +683,7 @@ final class AppViewModel: ObservableObject {
                             lampId: lamp.id, cloudLampId: lamp.cloudLampId, lampName: lamp.name,
                             hostname: "", firmware: lamp.firmware ?? "", power: lamp.state.power,
                             currentBrightness: lamp.state.brightness, targetBrightness: lamp.state.brightness,
-                            lastBrightness: max(lamp.state.brightness, 20), fadeMode: lamp.state.fadeMode,
+                            lastBrightness: lamp.state.rememberedBrightness, fadeMode: lamp.state.fadeMode,
                             timerRemainingSeconds: lamp.state.timerRemainingSeconds, ssid: lamp.wifiSSID ?? "",
                             rssi: lamp.wifiRSSI, ip: "", activeSSID: lamp.wifiSSID ?? "",
                             savedNetworkCount: 0, controllerCount: lamp.controllerCount,
@@ -496,7 +712,8 @@ final class AppViewModel: ObservableObject {
                         return fallback
                     },
                     bleAction: { self.ble.powerMode(mode) },
-                    cloudAction: nil
+                    cloudAction: nil,
+                    shouldContinue: { self.isCurrentControlIntent(intent, for: lamp, field: "powerMode") }
                 )
                 if mode == .bleOnly {
                     updateLocalRecord(for: lamp) { record in
@@ -522,26 +739,34 @@ final class AppViewModel: ObservableObject {
     }
 
     func setFade(_ lamp: LampRecord, mode: Int) {
+        let generation = nextControlIntent(for: lamp, field: "fade")
         let value = clamp(mode, 0...3)
+        let ordered = orderedIntents.next(
+            kind: .fade,
+            action: "setFadeMode",
+            valueFields: ["fadeMode": value]
+        )
         setPendingFade(lamp, value: value)
         optimistic(lamp.id) { $0.state.fadeMode = value }
         Task {
             do {
-                try await performRouted(
+                try await performOrderedRouted(
                     lamp: lamp,
-                    localAction: { host in try await self.local.sendFade(host: host, mode: value) },
-                    bleAction: { self.ble.fade(value) },
-                    cloudAction: {
-                        let remoteID = try self.remoteID(for: lamp)
-                        try await self.sendCloudCommand(lampID: remoteID, action: "setFadeMode", value: value)
-                    }
+                    intent: ordered,
+                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "fade") }
                 )
             } catch { handle(error) }
         }
     }
 
     func setTimer(_ lamp: LampRecord, minutes: Int) {
+        let generation = nextControlIntent(for: lamp, field: "timer")
         let value = [0, 15, 30, 60].contains(minutes) ? minutes : 0
+        let ordered = orderedIntents.next(
+            kind: .timer,
+            action: "setTimer",
+            valueFields: ["timerMinutes": value]
+        )
         let seconds = Int64(value * 60)
         setPendingTimer(lamp, seconds: seconds)
         optimistic(lamp.id) { $0.state.timerRemainingSeconds = seconds }
@@ -549,14 +774,10 @@ final class AppViewModel: ObservableObject {
         scheduleTimerNotification(for: lamp, remainingSeconds: seconds)
         Task {
             do {
-                try await performRouted(
+                try await performOrderedRouted(
                     lamp: lamp,
-                    localAction: { host in try await self.local.sendTimer(host: host, minutes: value) },
-                    bleAction: { self.ble.timer(value) },
-                    cloudAction: {
-                        let remoteID = try self.remoteID(for: lamp)
-                        try await self.sendCloudCommand(lampID: remoteID, action: "setTimer", value: value)
-                    }
+                    intent: ordered,
+                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "timer") }
                 )
             } catch { handle(error) }
         }
@@ -621,6 +842,21 @@ final class AppViewModel: ObservableObject {
         } catch { handle(error); return nil }
     }
 
+    private func controlIntentKey(for lamp: LampRecord, field: String) -> String {
+        "\(lamp.canonicalID.uppercased())|\(field)"
+    }
+
+    private func nextControlIntent(for lamp: LampRecord, field: String) -> Int {
+        let key = controlIntentKey(for: lamp, field: field)
+        let next = (controlIntentGenerations[key] ?? 0) + 1
+        controlIntentGenerations[key] = next
+        return next
+    }
+
+    private func isCurrentControlIntent(_ generation: Int, for lamp: LampRecord, field: String) -> Bool {
+        controlIntentGenerations[controlIntentKey(for: lamp, field: field)] == generation
+    }
+
     private func remoteID(for lamp: LampRecord) throws -> String {
         if lamp.cloudClaimed,
            let cloud = lamp.cloudLampId?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -641,12 +877,14 @@ final class AppViewModel: ObservableObject {
         lamp: LampRecord,
         localAction: ((String) async throws -> WiFiLampSnapshot)?,
         bleAction: (() -> Void)?,
-        cloudAction: (() async throws -> Void)?
+        cloudAction: (() async throws -> Void)?,
+        shouldContinue: (() -> Bool)? = nil
     ) async throws {
         let order = routeOrder(for: lamp)
 
         var lastFailure: Error?
         for route in order {
+            if let shouldContinue, !shouldContinue() { return }
             switch route {
             case .wifi:
                 guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
@@ -657,32 +895,100 @@ final class AppViewModel: ObservableObject {
                 guard let localAction else { continue }
                 do {
                     let requestStartedAt = Date()
-                    apply(snapshot: try await localAction(host), observedAt: requestStartedAt, authoritative: true)
+                    let snapshot = try await localAction(host)
+                    if let shouldContinue, !shouldContinue() { return }
+                    apply(snapshot: snapshot, observedAt: requestStartedAt, authoritative: true)
                     return
                 } catch {
+                    if let shouldContinue, !shouldContinue() { return }
                     lastFailure = error
                     markWiFiFailure(for: lamp)
                 }
             case .bluetooth:
                 guard canUseBLE(lamp), let bleAction else { continue }
+                if let shouldContinue, !shouldContinue() { return }
                 bleAction()
                 updateLocalRecord(for: lamp) { $0.route = .bluetooth; $0.online = true }
                 return
             case .cloud:
-                guard let cloudAction else { continue }
+                guard isCloudHealthy(lamp), let cloudAction else { continue }
+                if let shouldContinue, !shouldContinue() { return }
                 do {
                     try await cloudAction()
+                    if let shouldContinue, !shouldContinue() { return }
                     updateLocalRecord(for: lamp) { record in
                         if record.route == .offline { record.online = true }
                     }
                     return
                 } catch {
+                    if let shouldContinue, !shouldContinue() { return }
                     lastFailure = error
                 }
             case .offline:
                 continue
             }
         }
+        throw lastFailure ?? AppError.message("No available connection could control this lamp.")
+    }
+
+    private func performOrderedRouted(
+        lamp: LampRecord,
+        intent: OrderedControlIntent,
+        shouldContinue: (() -> Bool)? = nil
+    ) async throws {
+        let order = routeOrder(for: lamp)
+        var lastFailure: Error?
+
+        for route in order {
+            if let shouldContinue, !shouldContinue() { return }
+            switch route {
+            case .wifi:
+                guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
+                do {
+                    let requestStartedAt = Date()
+                    if let snapshot = try await local.sendOrderedCommand(host: host, intent: intent, waitForAck: true) {
+                        if let shouldContinue, !shouldContinue() { return }
+                        apply(snapshot: snapshot, observedAt: requestStartedAt, authoritative: true)
+                    }
+                    return
+                } catch {
+                    if let shouldContinue, !shouldContinue() { return }
+                    lastFailure = error
+                    markWiFiFailure(for: lamp)
+                }
+
+            case .bluetooth:
+                guard canUseBLE(lamp) else { continue }
+                do {
+                    try await ble.sendOrdered(intent: intent, waitForAck: true)
+                    if let shouldContinue, !shouldContinue() { return }
+                    updateLocalRecord(for: lamp) { $0.route = .bluetooth; $0.online = true }
+                    return
+                } catch {
+                    if let shouldContinue, !shouldContinue() { return }
+                    lastFailure = error
+                }
+
+            case .cloud:
+                guard isCloudHealthy(lamp) else { continue }
+                do {
+                    let remoteID = try remoteID(for: lamp)
+                    try await sendCloudOrderedCommand(lampID: remoteID, intent: intent)
+                    if let shouldContinue, !shouldContinue() { return }
+                    updateLocalRecord(for: lamp) { record in
+                        if record.route == .offline { record.online = true }
+                    }
+                    return
+                } catch {
+                    if let shouldContinue, !shouldContinue() { return }
+                    lastFailure = error
+                }
+
+            case .offline:
+                continue
+            }
+        }
+
         throw lastFailure ?? AppError.message("No available connection could control this lamp.")
     }
 
@@ -705,6 +1011,15 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func isCloudHealthy(_ lamp: LampRecord) -> Bool {
+        guard cloudConnected else { return false }
+        let candidateIDs = [lamp.cloudLampId?.uppercased(), lamp.id.uppercased()].compactMap { $0 }
+        guard !candidateIDs.isEmpty else { return false }
+        return dashboard.lamps.contains { cloudLamp in
+            candidateIDs.contains(cloudLamp.id.uppercased()) && cloudLamp.online
+        }
+    }
+
     /// BLE is preferred while it is genuinely healthy. Hysteresis prevents a
     /// lamp near the range boundary from bouncing BLE <-> LAN every few RSSI
     /// samples. Unknown RSSI immediately after connection still prefers BLE.
@@ -712,7 +1027,7 @@ final class AppViewModel: ObservableObject {
         let hasBLE = canUseBLE(lamp)
         let hasWiFi = isWiFiHealthy(lamp)
         guard hasBLE || hasWiFi else {
-            return cloudConnected ? .cloud : .offline
+            return isCloudHealthy(lamp) ? .cloud : .offline
         }
         guard hasBLE else { return .wifi }
         guard hasWiFi else { return .bluetooth }
@@ -774,26 +1089,34 @@ final class AppViewModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 if self.wifiPathAvailable {
-                    let records = self.localRecords.values.filter { $0.localHost != nil }
-                    for record in records {
-                        guard let host = record.localHost else { continue }
-                        let key = record.id.uppercased()
-                        // RF2: a realtime state socket proves only the event channel.
-                        // Keep one HTTP status probe after every phone Wi-Fi transition
-                        // before LAN is allowed to become the command route.
-                        if self.local.isRealtimeHealthy(host: host), self.hasWiFiCommandConfirmation(record) { continue }
-                        guard !self.localPollInFlight.contains(key) else { continue }
-                        self.localPollInFlight.insert(key)
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            defer { self.localPollInFlight.remove(key) }
-                            let requestStartedAt = Date()
-                            if let snapshot = try? await self.local.readStatus(host: host) {
-                                self.apply(snapshot: snapshot, observedAt: requestStartedAt)
-                            } else {
-                                self.noteLocalPollFailure(record)
+                    let records = self.localRecords.values
+                        .filter { $0.localHost != nil }
+                        .sorted { $0.canonicalID < $1.canonicalID }
+                    if !records.isEmpty {
+                        self.localPollCursor %= records.count
+                        let probeCount = min(2, records.count)
+                        for offset in 0..<probeCount {
+                            let record = records[(self.localPollCursor + offset) % records.count]
+                            guard let host = record.localHost else { continue }
+                            let key = record.id.uppercased()
+                            // Realtime sockets carry state continuously. HTTP is a
+                            // bounded rotating liveness confirmation, so dozens of
+                            // lamps cannot create a synchronized 2-second poll storm.
+                            if self.local.isRealtimeHealthy(host: host), self.hasWiFiCommandConfirmation(record) { continue }
+                            guard !self.localPollInFlight.contains(key) else { continue }
+                            self.localPollInFlight.insert(key)
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                defer { self.localPollInFlight.remove(key) }
+                                let requestStartedAt = Date()
+                                if let snapshot = try? await self.local.readStatus(host: host) {
+                                    self.apply(snapshot: snapshot, observedAt: requestStartedAt)
+                                } else {
+                                    self.noteLocalPollFailure(record)
+                                }
                             }
                         }
+                        self.localPollCursor = (self.localPollCursor + probeCount) % records.count
                     }
                 }
                 try? await Task.sleep(for: self.localPollInterval)
@@ -825,6 +1148,14 @@ final class AppViewModel: ObservableObject {
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
         guard wifiPathAvailable, let host = lamp.localHost else { return false }
         let keys = stateKeys(for: lamp)
+        // RF4: do not cross from Cloud to LAN while a recent cloud mutation can
+        // still be in flight. The backend RF4 control TTL is 2 seconds; this
+        // small extra margin closes the handover race without delaying normal
+        // LAN operation once the transition has settled.
+        if let lastCloudMutation = keys.compactMap({ lastCloudMutationAt[$0] }).max(),
+           now.timeIntervalSince(lastCloudMutation) < cloudToLanFence {
+            return false
+        }
         guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else {
             // RF2: Local WebSocket is state/event-only in Phase A. It must not
             // promote LAN to the command route until HTTP has succeeded once
@@ -929,14 +1260,97 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func sendCloudCommand(lampID: String, action: String, value: Any) async throws {
+    private func sendCloudOrderedCommand(lampID: String, intent: OrderedControlIntent) async throws {
+        let normalizedLampID = lampID.uppercased()
+        lastCloudMutationAt[normalizedLampID] = Date()
+        pendingCloudMutationCommands[intent.commandID] = normalizedLampID
+        latestCloudMutationCommandByLampID[normalizedLampID] = intent.commandID
+
+        defer {
+            pendingCloudMutationCommands.removeValue(forKey: intent.commandID)
+            if latestCloudMutationCommandByLampID[normalizedLampID] == intent.commandID {
+                latestCloudMutationCommandByLampID.removeValue(forKey: normalizedLampID)
+            }
+        }
+
+        // Prefer the authenticated app WebSocket and require the actual ESP ACK.
+        // A Render `commandAccepted` frame only proves queueing, not execution.
         if cloudConnected {
             do {
-                _ = try await realtime.sendCommand(lampID: lampID, action: action, value: value)
+                let ack = try await realtime.sendCommandAwaitingAck(
+                    lampID: normalizedLampID,
+                    action: intent.action,
+                    value: intent.value,
+                    commandID: intent.commandID,
+                    timeout: 2.4
+                )
+                if ack.bool("success") == false {
+                    throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
+                }
+                lastCloudMutationAt.removeValue(forKey: normalizedLampID)
                 return
             } catch {
+                // Retry the exact same command ID through REST. If the device
+                // already executed it and only the app ACK was lost, backend
+                // idempotency + ESP deduplication turn this into a status check.
+            }
+        }
+
+        let ack = try await withAccessToken { token in
+            try await api.sendCommandAndWaitForAck(
+                accessToken: token,
+                lampId: normalizedLampID,
+                action: intent.action,
+                value: intent.value,
+                commandID: intent.commandID,
+                timeout: 2.6
+            )
+        }
+        if ack.bool("success") == false {
+            throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
+        }
+        lastCloudMutationAt.removeValue(forKey: normalizedLampID)
+    }
+
+    private func sendCloudCommand(lampID: String, action: String, value: Any) async throws {
+        let normalizedLampID = lampID.uppercased()
+        let isStateMutation = ["setPower", "setBrightness", "setFadeMode", "setTimer"].contains(action)
+        if isStateMutation {
+            lastCloudMutationAt[normalizedLampID] = Date()
+        }
+        if cloudConnected {
+            let commandID = UUID().uuidString
+            if isStateMutation {
+                pendingCloudMutationCommands[commandID] = normalizedLampID
+                latestCloudMutationCommandByLampID[normalizedLampID] = commandID
+            }
+            do {
+                _ = try await realtime.sendCommand(
+                    lampID: lampID,
+                    action: action,
+                    value: value,
+                    commandID: commandID
+                )
+                if isStateMutation {
+                    Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(3))
+                        guard let self else { return }
+                        self.pendingCloudMutationCommands.removeValue(forKey: commandID)
+                        if self.latestCloudMutationCommandByLampID[normalizedLampID] == commandID {
+                            self.latestCloudMutationCommandByLampID.removeValue(forKey: normalizedLampID)
+                        }
+                    }
+                }
+                return
+            } catch {
+                pendingCloudMutationCommands.removeValue(forKey: commandID)
+                if latestCloudMutationCommandByLampID[normalizedLampID] == commandID {
+                    latestCloudMutationCommandByLampID.removeValue(forKey: normalizedLampID)
+                }
                 // The REST queue is a durable fallback if the live socket drops
-                // between UI route selection and the actual send.
+                // between UI route selection and the actual send. Keep the short
+                // Cloud->LAN fence because this fallback has no live ACK
+                // correlation in the current API.
             }
         }
         _ = try await withAccessToken { token in
@@ -957,6 +1371,20 @@ final class AppViewModel: ObservableObject {
                 let changed = self.wifiPathAvailable != hasWiFi
                 self.wifiPathAvailable = hasWiFi
                 guard changed else { return }
+
+                // RF4: explicitly rebind the account WebSocket whenever the
+                // iPhone changes between cellular and Wi-Fi. Leaving an old TCP
+                // WebSocket attached to the previous interface can otherwise
+                // produce several seconds of "cloud disconnected" or a half-dead
+                // socket after the route changes.
+                if path.status == .satisfied, let currentSession = self.session {
+                    self.realtime.start(
+                        token: currentSession.accessToken,
+                        homeID: self.dashboard.homes.first?.id ?? "default",
+                        force: true
+                    )
+                }
+
                 if hasWiFi {
                     // RF2 make-before-break handover: realtime state may resume
                     // immediately, but LAN does not become the command route until
@@ -1183,6 +1611,7 @@ final class AppViewModel: ObservableObject {
         let receivedAt = Date()
         let stateObservedAt = authoritative ? receivedAt : observedAt
         localSnapshots[localID] = snapshot
+        rememberedBrightnessByLamp[localID] = max(1, min(100, snapshot.lastBrightness))
         local.startRealtime(host: snapshot.host)
         if confirmsWiFiCommandPath {
             wifiConfirmedAt[localID] = receivedAt
@@ -1223,6 +1652,7 @@ final class AppViewModel: ObservableObject {
         var incomingState = LampState(
             power: snapshot.power,
             brightness: snapshot.targetBrightness,
+            rememberedBrightness: snapshot.lastBrightness,
             fadeMode: snapshot.fadeMode,
             timerRemainingSeconds: snapshot.timerRemainingSeconds,
             batteryValid: snapshot.batteryValid,
@@ -1409,7 +1839,7 @@ final class AppViewModel: ObservableObject {
         let linkedCloud = lamp.cloudLampId.flatMap { cloudID in
             dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
         }
-        let hasCloud = cloud?.online == true || linkedCloud?.online == true
+        let hasCloud = cloudConnected && (cloud?.online == true || linkedCloud?.online == true)
 
         switch lamp.routePreference {
         case .remote:
@@ -1478,6 +1908,10 @@ final class AppViewModel: ObservableObject {
             lamp.state = currentState
         }
 
+        if lamp.state.rememberedBrightness > 0 {
+            rememberedBrightnessByLamp[lamp.canonicalID.uppercased()] = lamp.state.rememberedBrightness
+            rememberedBrightnessByLamp[id] = lamp.state.rememberedBrightness
+        }
         cloudStateReceivedAt[id] = receivedAt
         if stateAccepted && timerAccepted { scheduleTimerNotification(for: lamp, remainingSeconds: reportedTimer) }
         dashboard.lamps.removeAll { $0.id.caseInsensitiveCompare(id) == .orderedSame }
@@ -1525,7 +1959,25 @@ final class AppViewModel: ObservableObject {
 extension AppViewModel: BLELampManagerDelegate {
     func bleManager(_ manager: BLELampManager, didUpdateNearby lamps: [NearbyLamp]) {
         nearbyLamps = lamps
-        guard !manualAddFlowActive, !manager.isReady, pendingAutoConnectPeripheralID == nil else { return }
+        guard !manualAddFlowActive, pendingAutoConnectPeripheralID == nil else { return }
+
+        // Focus ownership has priority even while BLE is ready for another
+        // lamp. This is the deterministic A -> B switching path.
+        if let focused = focusedLampCanonicalID,
+           let focusedRecord = self.lamps.first(where: { $0.canonicalID.uppercased() == focused }),
+           focusedRecord.routePreference != .remote,
+           !canUseBLE(focusedRecord),
+           let target = lamps.first(where: { nearby in
+               guard let record = knownRecord(for: nearby) else { return false }
+               return record.canonicalID.uppercased() == focused
+           }) {
+            pendingAutoConnectPeripheralID = target.id
+            manager.connect(to: target.id)
+            return
+        }
+
+        // Background auto-selection must never steal an already healthy link.
+        guard !manager.isReady else { return }
 
         if let known = lamps.first(where: { nearby in
             guard let record = knownRecord(for: nearby) else { return false }
@@ -1622,7 +2074,11 @@ extension AppViewModel: BLELampManagerDelegate {
     }
 
     func bleManager(_ manager: BLELampManager, didDisconnect peripheralID: UUID?) {
-        pendingAutoConnectPeripheralID = nil
+        // A delayed disconnect from the lamp we just left must not erase the
+        // pending/current ownership of the replacement lamp.
+        if manager.connectedPeripheralID == nil || manager.connectedPeripheralID == peripheralID {
+            pendingAutoConnectPeripheralID = nil
+        }
         if identityProbePeripheralID == peripheralID {
             if let peripheralID { probedPeripheralIDs.insert(peripheralID) }
             identityProbePeripheralID = nil
@@ -1636,10 +2092,14 @@ extension AppViewModel: BLELampManagerDelegate {
             record.online = record.route != .offline
             localRecords[key] = record
         }
-        connectedLocalID = ""
+        // CoreBluetooth may deliver A's disconnect after B has already been
+        // selected. Preserve B's global identity in that case.
+        if manager.connectedPeripheralID == nil {
+            connectedLocalID = ""
+        }
         persistLocalRecords()
         rebuildLamps()
-        if !manualAddFlowActive { manager.startScan() }
+        if !manualAddFlowActive && manager.connectedPeripheralID == nil { manager.startScan() }
     }
 
     func bleManager(_ manager: BLELampManager, didReceive status: BLELampStatus) {
@@ -1672,6 +2132,10 @@ extension AppViewModel: BLELampManagerDelegate {
         var incomingState = record.state
         incomingState.power = status.power
         incomingState.brightness = status.targetBrightness
+        if status.targetBrightness > 0 {
+            incomingState.rememberedBrightness = status.targetBrightness
+            rememberedBrightnessByLamp[record.canonicalID.uppercased()] = status.targetBrightness
+        }
         incomingState.fadeMode = status.fadeMode
         incomingState.timerRemainingSeconds = timerAccepted ? status.timerRemainingSeconds : currentState.timerRemainingSeconds
         record.state = protectedIncomingState(incomingState, for: record, current: currentState)
@@ -1770,6 +2234,14 @@ extension AppViewModel: CloudRealtimeClientDelegate {
     func realtimeClient(_ client: CloudRealtimeClient, didChangeStatus status: String, connected: Bool) {
         cloudStatus = status
         cloudConnected = connected
+        if !connected {
+            // An ACK cannot be correlated while this app socket is down. Keep
+            // lastCloudMutationAt so the bounded handover fence still protects
+            // against a command that may already be in flight, but drop the
+            // in-memory ACK correlation entries so they cannot leak.
+            pendingCloudMutationCommands.removeAll()
+            latestCloudMutationCommandByLampID.removeAll()
+        }
     }
 
     func realtimeClient(_ client: CloudRealtimeClient, didReceive object: JSONObject) {
@@ -1793,9 +2265,21 @@ extension AppViewModel: CloudRealtimeClientDelegate {
             if (type == "state" || object.object("state") != nil), let lamp = api.parseLamp(envelope) {
                 applyCloudLamp(lamp, receivedAt: receivedAt)
             }
-            if type == "ack", object.bool("success") == false {
-                let message = firstNonBlank(object.string("error"), "The lamp rejected the cloud command.")
-                errorMessage = message
+            if type == "ack" {
+                let commandID = object.string("commandId")
+                if let lampID = pendingCloudMutationCommands.removeValue(forKey: commandID) {
+                    // Only the newest cloud mutation for this lamp may release
+                    // the fence. An older ACK can arrive after a newer cloud
+                    // command and must not make that newer command look settled.
+                    if latestCloudMutationCommandByLampID[lampID] == commandID {
+                        latestCloudMutationCommandByLampID.removeValue(forKey: lampID)
+                        lastCloudMutationAt.removeValue(forKey: lampID)
+                    }
+                }
+                if object.bool("success") == false {
+                    let message = firstNonBlank(object.string("error"), "The lamp rejected the cloud command.")
+                    errorMessage = message
+                }
             }
             return
         }

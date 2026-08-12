@@ -1,84 +1,41 @@
-# SH Lamp Android + iOS — Integrated 1.5.0
+# SH Lamp iOS 1.7.4 — R21A RF5 Production Candidate
 
-This package contains the complete Smart Handicrafts® SH Lamp source for both platforms:
+Build: **1.7.4 (16)**  
+RF5 focus: **ordered BLE / Local Wi-Fi / Cloud control with latest-user-intent semantics**.
 
-- `android/` — Android app version 1.5.0 (`versionCode 7`).
-- `iosApp/` — native SwiftUI iPhone app version 1.5.0 (build 10).
-- `codemagic.yaml` — unsigned IPA workflow for Windows/Sideloadly.
-- `docs/` — protocol notes, release changes and physical-lamp test checklist.
+This source is the RF5 continuation of the R21A RF4 Handover Ordering release. RF5 does not race multiple transports to mutate the lamp. Instead, every mutating user intent receives a persistent controller identity/session/sequence and the **same ordered intent** is reused if routing falls back from one transport to another.
 
-## What changed in 1.5.0
+## RF5 behavior
 
-### One physical lamp, one device card
+- Power and brightness are one ordered **output domain**.
+- An output intent carries the complete desired output state: power, visible brightness, and remembered next-ON brightness.
+- Fade and timer have their own ordered domains but use the same controller-wide monotonically increasing intent sequence.
+- Local Wi-Fi, BLE and Cloud reuse the same command identity during fallback.
+- Old asynchronous iOS work is blocked by the latest-user-intent generation.
+- Rapid slider frames are ordered and are cancelled by later final/discrete output intent.
+- Cloud ACK means the ESP accepted/executed the command, not merely that Render attempted a send.
+- Local WebSocket command ACK and exact-ID HTTP fallback are supported.
+- BLE ordered ACKs are serialized so an ACK cannot be consumed by the wrong waiter.
+- Focused-lamp BLE ownership prevents multiple lamp views from competing for one central connection.
+- Many-lamp local polling is bounded/round-robin rather than polling every saved lamp each cycle.
+- Phone Wi-Fi/cellular path changes explicitly rebind the account Cloud WebSocket.
 
-BLE, local Wi-Fi and cloud are now connection routes attached to one physical lamp record. The app reads the firmware identity characteristic (`FFE3`) to link the local ID, cloud ID and BLE peripheral before creating or updating a device. Existing linked duplicates are migrated and merged while retaining local details and cloud ownership.
+## Persistent command sequence
 
-### Live route switching
+The app stores a stable controller ID and persistent session/high-water sequence in UserDefaults. Sequence numbers are leased in blocks of **4096** so a crash/relaunch cannot normally reuse a previously transmitted sequence. A relaunch may therefore jump forward (for example 1 → 4097); that is intentional.
 
-Automatic routing is:
+## Build
 
-`Local Wi-Fi → Bluetooth → Remote → Offline`
+The Xcode project is in:
 
-Phone Wi-Fi and Bluetooth changes are monitored while the app is open. A stale local route is invalidated immediately, known lamps are rediscovered over BLE, and commands retry through the next valid route. The control page also provides Automatic, Local Wi-Fi, Bluetooth and Remote preferences.
+`iosApp/SHLAMP.xcodeproj`
 
-### Corrected Add Lamp workflow
+Codemagic configuration is at `codemagic.yaml`.
 
-Selecting a nearby lamp only connects and verifies it. It is not saved until the user explicitly chooses and completes one of these paths:
+Static validation in this release passed Swift 5 parsing for all 19 Swift files and an extracted RF5 sequence-core type/execution test. A real Xcode/Codemagic Release build cannot be performed in the Linux validation environment and remains a release-gate test on your build system.
 
-- Add Bluetooth Lamp
-- Add Wi-Fi Lamp
-- Enable Remote Access
+## Deployment compatibility
 
-Wi-Fi provisioning no longer requires a cloud claim code. Remote claiming is a separate optional step and can be completed immediately or later from Lamp Settings.
+Deploy the matching RF5 Render backend first, then RF5 ESP firmware to one test lamp, then install this iOS build. RF5 ordering depends on all three layers understanding the ordered command/ACK contract. Do not mix this iOS app with RF4 firmware for production handover testing.
 
-### New control experience
-
-- Expanded control header at the top of the page
-- Compact sticky banner while scrolling
-- Automatic expansion when scrolling back up
-- iPhone-style battery indicator
-- Current route, power mode and runtime state
-- Balanced, Maximum Backup, BLE Only and Touch Only controls
-- Maximum Backup UI synchronized to the firmware's 70% ceiling
-- Confirmation warnings before BLE Only and Touch Only
-
-### Reliability changes
-
-- Initial BLE status request is sent once and debounced
-- Bluetooth identity setup is completed only once per connection
-- Connections live at the app/manager level rather than inside a single screen
-- Locally reported cloud identity is kept separate from verified account ownership
-- Stored iOS records decode safely when new fields are added
-
-## Firmware baseline
-
-This app update targets:
-
-`TTP2-WIFI-BLE-R19B-P3-20260806`
-
-It uses:
-
-- BLE service `FFE0`
-- control/status characteristic `FFE1`
-- Wi-Fi/status characteristic `FFE2`
-- identity characteristic `FFE3`
-- local power-mode endpoint `/api/power-mode`
-
-## Build without a Mac
-
-1. Upload this folder to the root of a private GitHub repository.
-2. Run **SH Lamp iOS - unsigned IPA for Sideloadly** in Codemagic.
-3. Download `SHLAMP-unsigned.ipa` from Artifacts.
-4. Install it through Sideloadly or AltServer.
-
-For Android, open `android/` in Android Studio and build the debug or release app normally.
-
-## Validation completed in this environment
-
-- Swift parser validation for all 19 Swift files
-- Standalone Swift type-check of the backward-compatible data models
-- Project structure, Xcode references, assets, permissions and Codemagic workflow checks
-- Android source structural scan
-- Cross-platform feature and protocol audit
-
-A full Xcode build is not possible in this Linux environment. A full Android Gradle build also requires the Android/Gradle dependencies to be available. Run the physical-lamp checklist in `docs/TEST_CHECKLIST_1_5_0.md` after building.
+See `RF5_RELEASE_NOTES.md` for the detailed changes and the outer bundle's `READ_ME_FIRST.md` for the exact hardware test sequence.

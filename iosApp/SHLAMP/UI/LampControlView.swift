@@ -52,7 +52,7 @@ struct LampControlView: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("Automatic prefers Local Wi-Fi, then Bluetooth, then Remote.")
+                    Text("Automatic uses the best healthy route: Bluetooth or Local Wi-Fi nearby, then Remote when needed.")
                 }
                 .alert(item: $pendingPowerMode) { mode in
                     Alert(
@@ -63,9 +63,13 @@ struct LampControlView: View {
                     )
                 }
                 .onAppear {
+                    model.focusLamp(lamp)
                     draftBrightness = Double(lamp.state.brightness)
                     isHeaderCollapsed = false
                     fallbackInitialScrollY = nil
+                }
+                .onDisappear {
+                    model.clearLampFocus(lamp)
                 }
                 .onChange(of: lamp.state.brightness) { _, newValue in
                     // While the user owns the slider, delayed BLE/Wi-Fi/cloud

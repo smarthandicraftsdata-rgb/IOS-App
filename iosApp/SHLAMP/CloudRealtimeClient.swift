@@ -19,6 +19,9 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
     private var candidateIndex = 0
     private var reconnectAttempt = 0
     private var pingTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private let ackLock = NSLock()
+    private var ackWaiters: [String: (lampID: String, continuation: CheckedContinuation<JSONObject, Error>, timeout: Task<Void, Never>)] = [:]
 
     init(baseURL: URL = AppEnvironment.cloudBaseURL) {
         self.baseURL = baseURL
@@ -59,6 +62,90 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         return commandID
     }
 
+    /// Sends one durable command and completes only when the authenticated ESP
+    /// returns its semantic ACK. Render `commandAccepted` is deliberately not
+    /// treated as execution success.
+    func sendCommandAwaitingAck(
+        lampID: String,
+        action: String,
+        value: Any,
+        commandID: String,
+        timeout: TimeInterval = 2.4
+    ) async throws -> JSONObject {
+        let expectedLampID = lampID.uppercased()
+        return try await withCheckedThrowingContinuation { continuation in
+            let timeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled, let self else { return }
+                self.failAck(commandID: commandID, error: AppError.message("The lamp did not acknowledge the cloud command."))
+            }
+
+            ackLock.lock()
+            let replaced = ackWaiters.updateValue((expectedLampID, continuation, timeoutTask), forKey: commandID)
+            ackLock.unlock()
+            if let replaced {
+                replaced.timeout.cancel()
+                replaced.continuation.resume(throwing: AppError.message("A newer cloud attempt replaced the same ordered command."))
+            }
+
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await self.sendCommand(
+                        lampID: lampID,
+                        action: action,
+                        value: value,
+                        live: false,
+                        commandID: commandID
+                    )
+                } catch {
+                    self.failAck(commandID: commandID, error: error)
+                }
+            }
+        }
+    }
+
+    private func resolveAck(_ object: JSONObject) {
+        let commandID = object.string("commandId")
+        guard !commandID.isEmpty else { return }
+
+        ackLock.lock()
+        guard let waiter = ackWaiters[commandID] else {
+            ackLock.unlock()
+            return
+        }
+        let reportedLampID = object.string("lampId").uppercased()
+        if !reportedLampID.isEmpty && reportedLampID != waiter.lampID {
+            ackLock.unlock()
+            // Wrong-device ACKs are not allowed to satisfy another lamp's
+            // command even if a command ID is accidentally reused.
+            return
+        }
+        ackWaiters.removeValue(forKey: commandID)
+        ackLock.unlock()
+        waiter.timeout.cancel()
+        waiter.continuation.resume(returning: object)
+    }
+
+    private func failAck(commandID: String, error: Error) {
+        ackLock.lock()
+        let waiter = ackWaiters.removeValue(forKey: commandID)
+        ackLock.unlock()
+        waiter?.timeout.cancel()
+        waiter?.continuation.resume(throwing: error)
+    }
+
+    private func failAllAcks(_ error: Error) {
+        ackLock.lock()
+        let waiters = Array(ackWaiters.values)
+        ackWaiters.removeAll()
+        ackLock.unlock()
+        for waiter in waiters {
+            waiter.timeout.cancel()
+            waiter.continuation.resume(throwing: error)
+        }
+    }
+
     func requestState(lampID: String) async throws -> String {
         try await sendCommand(lampID: lampID, action: "requestState", value: NSNull())
     }
@@ -67,8 +154,11 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         if !closeOnly { stopped = true }
         pingTask?.cancel()
         pingTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        failAllAcks(AppError.message("Live cloud connection closed before command acknowledgement."))
     }
 
     private func connectNext() {
@@ -77,11 +167,13 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
             scheduleReconnect("Live cloud reconnecting…")
             return
         }
+        reconnectTask?.cancel()
+        reconnectTask = nil
         let url = candidates[candidateIndex]
         candidateIndex += 1
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("SHLAMP-iOS/1.7.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.4-RF5", forHTTPHeaderField: "User-Agent")
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Connecting live cloud…", connected: false) }
         let newTask = session.webSocketTask(with: request)
         task = newTask
@@ -98,9 +190,13 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
             throw AppError.message("Could not encode the live cloud command.")
         }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            socket.send(.string(text)) { error in
-                if let error { continuation.resume(throwing: error) }
-                else { continuation.resume(returning: ()) }
+            socket.send(.string(text)) { [weak self, weak socket] error in
+                if let error {
+                    if let self, let socket { self.handleSocketFailure(socket, status: "Live cloud reconnecting…") }
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
             }
         }
     }
@@ -110,9 +206,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
             guard let self, let socket, self.task === socket, !self.stopped else { return }
             switch result {
             case .failure:
-                self.task = nil
-                if self.candidateIndex < self.candidates.count { self.connectNext() }
-                else { self.scheduleReconnect("Live cloud reconnecting…") }
+                self.handleSocketFailure(socket, status: "Live cloud reconnecting…")
             case .success(let message):
                 let text: String
                 switch message {
@@ -122,6 +216,9 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
                 }
                 if let data = text.data(using: .utf8), let object = try? parseJSONObject(data) {
                     let type = object.string("type")
+                    if type.caseInsensitiveCompare("ack") == .orderedSame {
+                        self.resolveAck(object)
+                    }
                     if type.caseInsensitiveCompare("authOk") == .orderedSame,
                        object.string("connection").caseInsensitiveCompare("app") == .orderedSame {
                         self.reconnectAttempt = 0
@@ -137,22 +234,41 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
     private func scheduleReconnect(_ status: String) {
         guard !stopped else { return }
         task = nil
+        reconnectTask?.cancel()
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: status, connected: false) }
         let exponent = min(reconnectAttempt, 4)
         let delay = min(1.5 * pow(2.0, Double(exponent)), 20.0)
         reconnectAttempt += 1
-        Task { [weak self] in
+        reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
-            guard let self, !self.stopped else { return }
+            guard !Task.isCancelled, let self, !self.stopped else { return }
+            self.reconnectTask = nil
             self.candidateIndex = 0
             self.connectNext()
+        }
+    }
+
+    private func handleSocketFailure(_ socket: URLSessionWebSocketTask, status: String) {
+        guard task === socket, !stopped else { return }
+        task = nil
+        pingTask?.cancel()
+        pingTask = nil
+        socket.cancel(with: .goingAway, reason: nil)
+        failAllAcks(AppError.message("Live cloud connection changed before command acknowledgement."))
+        if candidateIndex < candidates.count {
+            connectNext()
+        } else {
+            scheduleReconnect(status)
         }
     }
 
     private func makeCandidates() -> [URL] {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         components?.scheme = baseURL.scheme == "http" ? "ws" : "wss"
-        return ["/ws/app", "/api/ws/app"].compactMap { path in
+        // The coordinated Render backend exposes exactly /ws/app. Keeping a
+        // non-existent legacy /api/ws/app candidate adds an unnecessary failed
+        // handshake to every genuine reconnect episode.
+        return ["/ws/app"].compactMap { path in
             var copy = components
             copy?.path = path
             return copy?.url
@@ -171,14 +287,18 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(25))
                 guard let self, let webSocketTask, self.task === webSocketTask else { return }
-                webSocketTask.sendPing { _ in }
+                webSocketTask.sendPing { [weak self, weak webSocketTask] error in
+                    guard let self, let webSocketTask else { return }
+                    if error != nil {
+                        self.handleSocketFailure(webSocketTask, status: "Live cloud reconnecting…")
+                    }
+                }
             }
         }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         guard task === webSocketTask else { return }
-        task = nil
-        if !stopped { scheduleReconnect("Live cloud reconnecting…") }
+        handleSocketFailure(webSocketTask, status: "Live cloud reconnecting…")
     }
 }
