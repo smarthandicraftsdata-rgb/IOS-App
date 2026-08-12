@@ -1,32 +1,21 @@
-SH Lamp Android + iOS Integrated Release Manifest
-Generated: 2026-08-06
-Android source version: 1.5.0 (versionCode 7)
-iOS version: 1.5.0 (build 10)
-iOS deployment target: 17.0
-iOS bundle identifier: com.smarthandicrafts.shlamp
-Codemagic workflow: ios-unsigned-sideloadly
-Target firmware: TTP2-WIFI-BLE-R19B-P3-20260806
+SH Lamp RF5.2 iOS Route Recovery Manifest
+Date: 2026-08-12
+iOS version: 1.7.6 (build 18)
+Base: RF5.1 iOS 1.7.5 (17)
+Target firmware: RF5 or RF5.1 protocol-v3 firmware
+Backend: RF5 backend unchanged
 
-Swift files: 19
+Changed iOS production source:
+- iosApp/SHLAMP/AppViewModel.swift
+- iosApp/SHLAMP/CloudRealtimeClient.swift
+- iosApp/SHLAMP/CloudAPI.swift (User-Agent/version only)
+- iosApp/SHLAMP/LocalLampController.swift (User-Agent/version only)
+- iosApp/SHLAMP.xcodeproj/project.pbxproj (1.7.6 / build 18)
 
-Integrated scope:
-- One canonical physical-lamp record across BLE, local Wi-Fi and cloud
-- Existing duplicate-record migration and alias merging
-- Automatic Local Wi-Fi > Bluetooth > Remote > Offline route selection
-- Immediate phone Wi-Fi/Bluetooth state reaction and command failover
-- Manual Automatic/Wi-Fi/Bluetooth/Remote route preference
-- Nearby identity probing through FFE3 without creating another device
-- Explicit Bluetooth-only, Wi-Fi and remote-access setup paths
-- Wi-Fi provisioning separated from cloud claiming
-- Remote access available immediately or later from settings
-- Collapsible lamp-control header and compact sticky banner
-- iPhone-style battery indicator
-- Balanced, Maximum Backup, BLE Only and Touch Only controls
-- Runtime-state display and Maximum Backup 70% synchronization
-- BLE initial-status deduplication and persistent app-level connections
-
-Validation boundary:
-- Swift parsing and model type-check completed
-- Project and protocol audit scripts completed
-- Android source structural scan completed
-- Full Android Studio, Xcode/Codemagic and physical-lamp runtime tests remain required
+Route-recovery behavior:
+- local v3 realtime socket can directly establish LAN health
+- cloud REST semantic-ACK fallback remains usable during app WS rebind
+- immediate route rebuild on cloud socket status
+- bounded REST dashboard reconciliation on interface changes
+- 6 s cloud auth timeout
+- 12 s Wi-Fi attachment host-retention grace

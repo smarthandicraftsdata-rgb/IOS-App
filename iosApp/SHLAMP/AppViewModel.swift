@@ -162,6 +162,8 @@ final class AppViewModel: ObservableObject {
     private var pendingAutoConnectPeripheralID: UUID?
     private var probedPeripheralIDs: Set<UUID> = []
     private var wifiPathAvailable = false
+    private var wifiAttachedAt: Date?
+    private var cloudReconcileTask: Task<Void, Never>?
     private var wifiConfirmedAt: [String: Date] = [:]
     private var localStateReceivedAt: [String: Date] = [:]
     private var bleStateReceivedAt: [String: Date] = [:]
@@ -200,6 +202,7 @@ final class AppViewModel: ObservableObject {
     private let cloudToLanFence: TimeInterval = 2.25
 
     private let wifiHealthTTL: TimeInterval = 7
+    private let wifiTransitionGrace: TimeInterval = 12
     private let localPollInterval: Duration = .seconds(2)
 
     init() {
@@ -314,6 +317,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func signOut(message: String = "Signed out.") {
+        cloudReconcileTask?.cancel()
+        cloudReconcileTask = nil
         realtime.stop()
         local.stopDiscovery()
         ble.disconnect()
@@ -361,6 +366,7 @@ final class AppViewModel: ObservableObject {
         if !manualAddFlowActive { ble.startScan() }
         if let token = session?.accessToken {
             realtime.start(token: token, homeID: dashboard.homes.first?.id ?? "default")
+            scheduleCloudRouteReconciliation()
         }
     }
 
@@ -496,13 +502,42 @@ final class AppViewModel: ObservableObject {
         pendingStreamingOutputIntents.removeValue(forKey: key)
     }
 
+    /// RF5.1 resolves the newest merged lamp record before building an ordered
+    /// output intent. UI views can hold a value-type LampRecord briefly after a
+    /// local/cloud state update; using only that stale copy could overwrite the
+    /// ESP's saved brightness with the model default (20%).
+    private func freshestLampRecord(for lamp: LampRecord) -> LampRecord {
+        let canonical = lamp.canonicalID.uppercased()
+        return lamps.first { candidate in
+            candidate.canonicalID.uppercased() == canonical ||
+            candidate.id.uppercased() == lamp.id.uppercased() ||
+            (lamp.cloudLampId != nil && candidate.cloudLampId?.uppercased() == lamp.cloudLampId?.uppercased())
+        } ?? lamp
+    }
+
+    private func rememberedBrightness(for lamp: LampRecord) -> Int {
+        let fresh = freshestLampRecord(for: lamp)
+        let keys = [
+            lamp.canonicalID.uppercased(),
+            lamp.id.uppercased(),
+            lamp.cloudLampId?.uppercased(),
+            fresh.canonicalID.uppercased(),
+            fresh.id.uppercased(),
+            fresh.cloudLampId?.uppercased()
+        ].compactMap { $0 }
+        if let cached = keys.compactMap({ rememberedBrightnessByLamp[$0] }).first {
+            return max(1, min(100, cached))
+        }
+        return max(1, min(100, fresh.state.rememberedBrightness))
+    }
+
     private func makeOutputIntent(_ lamp: LampRecord, power: Bool, brightness requestedBrightness: Int) -> OrderedControlIntent {
-        let key = lamp.canonicalID.uppercased()
-        let maximum = lamp.state.powerMode == .maximumBackup ? 70 : 100
+        let fresh = freshestLampRecord(for: lamp)
+        let key = fresh.canonicalID.uppercased()
+        let maximum = fresh.state.powerMode == .maximumBackup ? 70 : 100
         let requested = clamp(requestedBrightness, 0...100)
         let capped = min(requested, maximum)
-        let knownRemembered = rememberedBrightnessByLamp[key]
-            ?? max(1, min(100, lamp.state.rememberedBrightness))
+        let knownRemembered = rememberedBrightness(for: fresh)
         let remembered: Int
         let brightness: Int
         if power {
@@ -527,8 +562,10 @@ final class AppViewModel: ObservableObject {
     func setPower(_ lamp: LampRecord, on: Bool) {
         cancelBrightnessStream(for: lamp)
         let generation = nextControlIntent(for: lamp, field: "output")
-        let desiredBrightness = on ? max(lamp.state.brightness, lamp.state.rememberedBrightness) : 0
-        let ordered = makeOutputIntent(lamp, power: on, brightness: desiredBrightness)
+        let fresh = freshestLampRecord(for: lamp)
+        let savedBrightness = rememberedBrightness(for: fresh)
+        let desiredBrightness = on ? max(fresh.state.brightness, savedBrightness) : 0
+        let ordered = makeOutputIntent(fresh, power: on, brightness: desiredBrightness)
         let targetBrightness = ordered.value["brightness"] as? Int ?? 0
         let remembered = ordered.value["rememberedBrightness"] as? Int ?? max(targetBrightness, 20)
 
@@ -645,7 +682,10 @@ final class AppViewModel: ObservableObject {
                     return
                 } catch { continue }
             case .cloud:
-                guard isCloudHealthy(lamp), let remoteID = try? remoteID(for: lamp) else { continue }
+                // Intermediate slider frames are intentionally live-only. If
+                // the app WebSocket is rebinding, skip these frames; the final
+                // released brightness still uses the durable REST/ACK fallback.
+                guard cloudConnected, isCloudHealthy(lamp), let remoteID = try? remoteID(for: lamp) else { continue }
                 do {
                     _ = try await realtime.sendCommand(
                         lampID: remoteID,
@@ -1012,7 +1052,14 @@ final class AppViewModel: ObservableObject {
     }
 
     private func isCloudHealthy(_ lamp: LampRecord) -> Bool {
-        guard cloudConnected else { return false }
+        // RF5.2: the authenticated app WebSocket is the fast realtime path,
+        // not the only valid cloud transport. RF5 already has a REST command
+        // fallback that waits for the ESP semantic ACK. During an iPhone
+        // Wi-Fi/cellular rebind the app WebSocket can be reconnecting for a few
+        // seconds while Render still knows the ESP is online. Keep Remote
+        // usable in that window instead of incorrectly declaring the lamp
+        // Offline and refusing to send the REST fallback.
+        guard session != nil else { return false }
         let candidateIDs = [lamp.cloudLampId?.uppercased(), lamp.id.uppercased()].compactMap { $0 }
         guard !candidateIDs.isEmpty else { return false }
         return dashboard.lamps.contains { cloudLamp in
@@ -1102,7 +1149,12 @@ final class AppViewModel: ObservableObject {
                             // Realtime sockets carry state continuously. HTTP is a
                             // bounded rotating liveness confirmation, so dozens of
                             // lamps cannot create a synchronized 2-second poll storm.
-                            if self.local.isRealtimeHealthy(host: host), self.hasWiFiCommandConfirmation(record) { continue }
+                            // RF5.2: protocol-v3 local WebSocket is now an
+                            // authenticated-by-identity, ordered, ACKed command
+                            // transport. A validated realtime state therefore
+                            // proves the current Wi-Fi path by itself; an extra
+                            // HTTP status probe is no longer required.
+                            if self.local.isRealtimeHealthy(host: host) { continue }
                             guard !self.localPollInFlight.contains(key) else { continue }
                             self.localPollInFlight.insert(key)
                             Task { @MainActor [weak self] in
@@ -1126,7 +1178,27 @@ final class AppViewModel: ObservableObject {
 
     private func noteLocalPollFailure(_ lamp: LampRecord) {
         let key = lamp.id.uppercased()
+
+        // A live protocol-v3 socket is stronger evidence than a single HTTP
+        // timeout. Do not let a transient HTTP miss tear down a working LAN
+        // route or erase the remembered host.
+        if let host = lamp.localHost, local.isRealtimeHealthy(host: host) {
+            localFailureCounts[key] = 0
+            rebuildLamps()
+            return
+        }
+
         for stateKey in stateKeys(for: lamp) { wifiConfirmedAt.removeValue(forKey: stateKey) }
+
+        // iOS can report the new Wi-Fi path before local HTTP is fully usable.
+        // Preserve the known host during that attachment grace period so three
+        // 2-second poll misses cannot erase LAN identity while the socket and
+        // Bonjour stack are still settling.
+        if let attachedAt = wifiAttachedAt, Date().timeIntervalSince(attachedAt) < wifiTransitionGrace {
+            rebuildLamps()
+            return
+        }
+
         let failures = (localFailureCounts[key] ?? 0) + 1
         localFailureCounts[key] = failures
         guard failures >= 3, var record = localRecords[key] else {
@@ -1141,10 +1213,6 @@ final class AppViewModel: ObservableObject {
         rebuildLamps()
     }
 
-    private func hasWiFiCommandConfirmation(_ lamp: LampRecord) -> Bool {
-        stateKeys(for: lamp).contains { wifiConfirmedAt[$0] != nil }
-    }
-
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
         guard wifiPathAvailable, let host = lamp.localHost else { return false }
         let keys = stateKeys(for: lamp)
@@ -1156,16 +1224,19 @@ final class AppViewModel: ObservableObject {
            now.timeIntervalSince(lastCloudMutation) < cloudToLanFence {
             return false
         }
-        guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else {
-            // RF2: Local WebSocket is state/event-only in Phase A. It must not
-            // promote LAN to the command route until HTTP has succeeded once
-            // on the current phone Wi-Fi attachment.
-            return false
-        }
-        // Once HTTP has been proven on this Wi-Fi attachment, an actively
-        // receiving local realtime socket keeps LAN healthy without 2-second
-        // HTTP polling. If realtime is down, fall back to the short HTTP TTL.
+
+        // RF5.2: protocol v3 changed the local WebSocket from Phase-A
+        // state-only transport into an ordered command channel with semantic
+        // ACK and same-command HTTP fallback. Once the socket has received and
+        // validated an authoritative state from this physical lamp, it is a
+        // complete proof of LAN reachability on the current phone Wi-Fi path.
+        // Requiring a separate HTTP success here was the reason the video could
+        // show Offline even while the ESP logged a connected local realtime
+        // client.
         if local.isRealtimeHealthy(host: host, now: now) { return true }
+
+        // If realtime is unavailable, retain the bounded HTTP liveness fallback.
+        guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else { return false }
         return now.timeIntervalSince(last) <= wifiHealthTTL
     }
 
@@ -1363,6 +1434,27 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func scheduleCloudRouteReconciliation() {
+        cloudReconcileTask?.cancel()
+        guard session != nil else { return }
+        cloudReconcileTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .milliseconds(550))
+            guard !Task.isCancelled else { return }
+            do {
+                try await self.refreshDashboard(silent: true)
+                return
+            } catch {
+                // A network interface can still be settling when NWPath first
+                // flips. One bounded retry is enough; normal realtime/refresh
+                // paths continue after that.
+            }
+            try? await Task.sleep(for: .seconds(1.7))
+            guard !Task.isCancelled else { return }
+            try? await self.refreshDashboard(silent: true)
+        }
+    }
+
     private func startNetworkMonitor() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let hasWiFi = path.status == .satisfied && path.usesInterfaceType(.wifi)
@@ -1383,12 +1475,18 @@ final class AppViewModel: ObservableObject {
                         homeID: self.dashboard.homes.first?.id ?? "default",
                         force: true
                     )
+                    // Reconcile the backend's current device-online flags by
+                    // REST as well. This is intentionally independent of the
+                    // app WebSocket so a half-open/rebinding live socket cannot
+                    // leave the UI stuck Offline.
+                    self.scheduleCloudRouteReconciliation()
                 }
 
                 if hasWiFi {
-                    // RF2 make-before-break handover: realtime state may resume
-                    // immediately, but LAN does not become the command route until
-                    // HTTP /api/status has succeeded on this new phone Wi-Fi path.
+                    self.wifiAttachedAt = Date()
+                    // RF5.2 make-before-break: clear HTTP proof from the old
+                    // attachment, but allow a validated protocol-v3 realtime
+                    // state to promote LAN immediately on the new Wi-Fi path.
                     self.wifiConfirmedAt.removeAll()
                     let remembered = Array(self.localRecords.values.filter { $0.localHost != nil })
                     for record in remembered {
@@ -1413,6 +1511,7 @@ final class AppViewModel: ObservableObject {
                     }
                     self.local.startDiscovery()
                 } else {
+                    self.wifiAttachedAt = nil
                     self.local.stopDiscovery()
                     self.wifiConfirmedAt.removeAll()
                     for key in Array(self.localRecords.keys) {
@@ -1621,6 +1720,7 @@ final class AppViewModel: ObservableObject {
 
         let cloudID = snapshot.cloudLampId?.uppercased()
         if let cloudID {
+            rememberedBrightnessByLamp[cloudID] = max(1, min(100, snapshot.lastBrightness))
             if confirmsWiFiCommandPath {
                 wifiConfirmedAt[cloudID] = receivedAt
                 localFailureCounts[cloudID] = 0
@@ -1836,10 +1936,9 @@ final class AppViewModel: ObservableObject {
     private func selectedRoute(for lamp: LampRecord, local: LampRecord?, cloud: LampRecord?) -> LampConnectionRoute {
         let hasWiFi = local.map { isWiFiHealthy($0) } ?? false
         let hasBLE = local.map(canUseBLE) ?? false
-        let linkedCloud = lamp.cloudLampId.flatMap { cloudID in
-            dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
-        }
-        let hasCloud = cloudConnected && (cloud?.online == true || linkedCloud?.online == true)
+        // RF5.2: Remote remains usable through the semantic-ACK REST fallback
+        // while the app realtime WebSocket is rebinding.
+        let hasCloud = isCloudHealthy(lamp)
 
         switch lamp.routePreference {
         case .remote:
@@ -2132,8 +2231,19 @@ extension AppViewModel: BLELampManagerDelegate {
         var incomingState = record.state
         incomingState.power = status.power
         incomingState.brightness = status.targetBrightness
-        if status.targetBrightness > 0 {
+        if let reportedRemembered = status.rememberedBrightness {
+            let remembered = max(1, min(100, reportedRemembered))
+            incomingState.rememberedBrightness = remembered
+            rememberedBrightnessByLamp[record.id.uppercased()] = remembered
+            rememberedBrightnessByLamp[record.canonicalID.uppercased()] = remembered
+            if let cloudID = record.cloudLampId?.uppercased() {
+                rememberedBrightnessByLamp[cloudID] = remembered
+            }
+        } else if status.targetBrightness > 0 {
+            // Backward compatibility with older firmware that did not report
+            // lastNonZeroBrightness while the lamp was OFF.
             incomingState.rememberedBrightness = status.targetBrightness
+            rememberedBrightnessByLamp[record.id.uppercased()] = status.targetBrightness
             rememberedBrightnessByLamp[record.canonicalID.uppercased()] = status.targetBrightness
         }
         incomingState.fadeMode = status.fadeMode
@@ -2144,6 +2254,30 @@ extension AppViewModel: BLELampManagerDelegate {
         }
         localRecords[key] = record
         rebuildLamps()
+    }
+
+    func bleManager(_ manager: BLELampManager, didReceiveRememberedBrightness percent: Int, lampID: String) {
+        let key = (lampID.isEmpty ? connectedLocalID : lampID).uppercased()
+        guard !key.isEmpty else { return }
+        let remembered = max(1, min(100, percent))
+        rememberedBrightnessByLamp[key] = remembered
+
+        if var record = localRecords[key] {
+            record.state.rememberedBrightness = remembered
+            localRecords[key] = record
+            rememberedBrightnessByLamp[record.canonicalID.uppercased()] = remembered
+            if let cloudID = record.cloudLampId?.uppercased() {
+                rememberedBrightnessByLamp[cloudID] = remembered
+            }
+        }
+
+        if let index = lamps.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(key) == .orderedSame ||
+            $0.canonicalID.caseInsensitiveCompare(key) == .orderedSame
+        }) {
+            lamps[index].state.rememberedBrightness = remembered
+            rememberedBrightnessByLamp[lamps[index].canonicalID.uppercased()] = remembered
+        }
     }
 
     func bleManager(_ manager: BLELampManager, didReceiveBattery percent: Int, lampID: String) {
@@ -2234,7 +2368,16 @@ extension AppViewModel: CloudRealtimeClientDelegate {
     func realtimeClient(_ client: CloudRealtimeClient, didChangeStatus status: String, connected: Bool) {
         cloudStatus = status
         cloudConnected = connected
-        if !connected {
+
+        // RF5.2: route badges are derived from cloudConnected + current device
+        // state. Rebuild immediately on every app-socket transition; previously
+        // a reconnect could succeed internally while the visible lamp stayed
+        // Offline until some unrelated state event arrived later.
+        rebuildLamps()
+
+        if connected {
+            scheduleCloudRouteReconciliation()
+        } else {
             // An ACK cannot be correlated while this app socket is down. Keep
             // lastCloudMutationAt so the bounded handover fence still protects
             // against a command that may already be in flight, but drop the
@@ -2256,6 +2399,9 @@ extension AppViewModel: CloudRealtimeClientDelegate {
             if !liveDevices.isEmpty {
                 for lamp in liveDevices { applyCloudLamp(lamp, receivedAt: receivedAt) }
             }
+            // Even an empty device list is authoritative for the just-
+            // authenticated account socket. Re-evaluate visible routes now.
+            rebuildLamps()
             return
         }
 

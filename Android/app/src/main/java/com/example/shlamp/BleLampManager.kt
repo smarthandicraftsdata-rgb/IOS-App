@@ -25,6 +25,7 @@ internal data class BleLampStatus(
     val power: Boolean,
     val targetBrightness: Int,
     val currentBrightness: Int,
+    val rememberedBrightness: Int?,
     val fadeMode: Int,
     val timerRemainingSeconds: Long,
     val rssi: Int
@@ -42,6 +43,7 @@ internal interface BleLampListener {
     fun onBleReady(lampId: String, address: String, advertisedName: String)
     fun onBleDisconnected(address: String?)
     fun onBleLampStatus(status: BleLampStatus)
+    fun onBleRememberedBrightness(lampId: String, percent: Int)
     fun onBleBatteryLevel(lampId: String, percent: Int)
     fun onBlePowerMode(mode: LampPowerMode)
     fun onBleWifiStatus(message: String)
@@ -115,6 +117,7 @@ internal class BleLampManager(
     private var connectedAddress: String? = null
     private var connectedAdvertisedName = "SH Lamp"
     private var connectedLampId = ""
+    private var lastRememberedBrightness: Int? = null
     private var negotiatedMtu = 23
     private var lastRssi = -127
     private var initialStateRequested = false
@@ -628,15 +631,26 @@ internal class BleLampManager(
 
     private fun parseControlStatus(bytes: ByteArray) {
         val text = bytes.toString(Charsets.UTF_8).trim()
-        val match = Regex("^P([01])B(\\d{3})C(\\d{3})F([0-3])T(\\d{5})$")
+        Regex("^L(\\d{3})$").matchEntire(text)?.let { rememberedMatch ->
+            val remembered = rememberedMatch.groupValues[1].toInt().coerceIn(1, 100)
+            lastRememberedBrightness = remembered
+            val lampId = connectedLampId.ifBlank {
+                parseLampIdFromName(connectedAdvertisedName).ifBlank { return }
+            }
+            handler.post { listener.onBleRememberedBrightness(lampId, remembered) }
+            return
+        }
+        val match = Regex("^P([01])B(\\d{3})C(\\d{3})(?:L(\\d{3}))?F([0-3])T(\\d{5})$")
             .matchEntire(text) ?: return
         val status = BleLampStatus(
             lampId = connectedLampId,
             power = match.groupValues[1] == "1",
             targetBrightness = match.groupValues[2].toInt().coerceIn(0, 100),
             currentBrightness = match.groupValues[3].toInt().coerceIn(0, 100),
-            fadeMode = match.groupValues[4].toInt().coerceIn(0, 3),
-            timerRemainingSeconds = match.groupValues[5].toLong().coerceAtLeast(0L),
+            rememberedBrightness = match.groupValues[4].toIntOrNull()?.coerceIn(1, 100)
+                ?: lastRememberedBrightness,
+            fadeMode = match.groupValues[5].toInt().coerceIn(0, 3),
+            timerRemainingSeconds = match.groupValues[6].toLong().coerceAtLeast(0L),
             rssi = lastRssi
         )
         handler.post { listener.onBleLampStatus(status) }
@@ -879,6 +893,7 @@ internal class BleLampManager(
             writeRunning = false
         }
         connectedLampId = ""
+        lastRememberedBrightness = null
         negotiatedMtu = 23
         lastRssi = -127
         initialStateRequested = false

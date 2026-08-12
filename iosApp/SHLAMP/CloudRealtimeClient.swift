@@ -20,6 +20,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
     private var reconnectAttempt = 0
     private var pingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var authTimeoutTask: Task<Void, Never>?
     private let ackLock = NSLock()
     private var ackWaiters: [String: (lampID: String, continuation: CheckedContinuation<JSONObject, Error>, timeout: Task<Void, Never>)] = [:]
 
@@ -156,6 +157,8 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         pingTask = nil
         reconnectTask?.cancel()
         reconnectTask = nil
+        authTimeoutTask?.cancel()
+        authTimeoutTask = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         failAllAcks(AppError.message("Live cloud connection closed before command acknowledgement."))
@@ -173,7 +176,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         candidateIndex += 1
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("SHLAMP-iOS/1.7.4-RF5", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.7.6-RF5.2", forHTTPHeaderField: "User-Agent")
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Connecting live cloud…", connected: false) }
         let newTask = session.webSocketTask(with: request)
         task = newTask
@@ -222,6 +225,8 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
                     if type.caseInsensitiveCompare("authOk") == .orderedSame,
                        object.string("connection").caseInsensitiveCompare("app") == .orderedSame {
                         self.reconnectAttempt = 0
+                        self.authTimeoutTask?.cancel()
+                        self.authTimeoutTask = nil
                         Task { @MainActor in self.delegate?.realtimeClient(self, didChangeStatus: "Live cloud connected.", connected: true) }
                     }
                     Task { @MainActor in self.delegate?.realtimeClient(self, didReceive: object) }
@@ -234,6 +239,8 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
     private func scheduleReconnect(_ status: String) {
         guard !stopped else { return }
         task = nil
+        authTimeoutTask?.cancel()
+        authTimeoutTask = nil
         reconnectTask?.cancel()
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: status, connected: false) }
         let exponent = min(reconnectAttempt, 4)
@@ -253,6 +260,8 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         task = nil
         pingTask?.cancel()
         pingTask = nil
+        authTimeoutTask?.cancel()
+        authTimeoutTask = nil
         socket.cancel(with: .goingAway, reason: nil)
         failAllAcks(AppError.message("Live cloud connection changed before command acknowledgement."))
         if candidateIndex < candidates.count {
@@ -279,9 +288,29 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         guard task === webSocketTask, !stopped else { return }
         let auth: JSONObject = ["type": "auth", "token": token]
         if let data = try? jsonData(auth), let text = String(data: data, encoding: .utf8) {
-            webSocketTask.send(.string(text)) { _ in }
+            webSocketTask.send(.string(text)) { [weak self, weak webSocketTask] error in
+                guard let self, let webSocketTask else { return }
+                if error != nil {
+                    self.handleSocketFailure(webSocketTask, status: "Cloud authentication send failed. Reconnecting…")
+                }
+            }
+        } else {
+            handleSocketFailure(webSocketTask, status: "Cloud authentication could not be encoded. Reconnecting…")
+            return
         }
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Authenticating cloud account…", connected: false) }
+
+        // RF5.2: a TCP/WebSocket open is not enough. If authOk never arrives
+        // (for example during an iOS Wi-Fi/cellular handover with a half-open
+        // socket), force a bounded reconnect instead of leaving the app in an
+        // indefinite Offline/Authenticating state.
+        authTimeoutTask?.cancel()
+        authTimeoutTask = Task { [weak self, weak webSocketTask] in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled, let self, let webSocketTask, self.task === webSocketTask else { return }
+            self.handleSocketFailure(webSocketTask, status: "Cloud authentication timed out. Reconnecting…")
+        }
+
         pingTask?.cancel()
         pingTask = Task { [weak self, weak webSocketTask] in
             while !Task.isCancelled {

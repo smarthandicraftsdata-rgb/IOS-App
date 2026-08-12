@@ -1,41 +1,32 @@
-# SH Lamp iOS 1.7.4 — R21A RF5 Production Candidate
+# SH Lamp iOS 1.7.6 — R21A RF5.2 Route Recovery
 
-Build: **1.7.4 (16)**  
-RF5 focus: **ordered BLE / Local Wi-Fi / Cloud control with latest-user-intent semantics**.
+Build: **1.7.6 (18)**  
+Base: **RF5.1 remembered-brightness fix + RF5 universal ordered transport**
 
-This source is the RF5 continuation of the R21A RF4 Handover Ordering release. RF5 does not race multiple transports to mutate the lamp. Instead, every mutating user intent receives a persistent controller identity/session/sequence and the **same ordered intent** is reused if routing falls back from one transport to another.
+## Why RF5.2 exists
 
-## RF5 behavior
+The extended physical test/video showed the app reporting **Offline** while the ESP was still connected to router Wi-Fi/cloud and, later, while the ESP logged a connected local realtime client. This exposed stale RF2-era route-health rules in the iOS app rather than a loss of ESP connectivity.
 
-- Power and brightness are one ordered **output domain**.
-- An output intent carries the complete desired output state: power, visible brightness, and remembered next-ON brightness.
-- Fade and timer have their own ordered domains but use the same controller-wide monotonically increasing intent sequence.
-- Local Wi-Fi, BLE and Cloud reuse the same command identity during fallback.
-- Old asynchronous iOS work is blocked by the latest-user-intent generation.
-- Rapid slider frames are ordered and are cancelled by later final/discrete output intent.
-- Cloud ACK means the ESP accepted/executed the command, not merely that Render attempted a send.
-- Local WebSocket command ACK and exact-ID HTTP fallback are supported.
-- BLE ordered ACKs are serialized so an ACK cannot be consumed by the wrong waiter.
-- Focused-lamp BLE ownership prevents multiple lamp views from competing for one central connection.
-- Many-lamp local polling is bounded/round-robin rather than polling every saved lamp each cycle.
-- Phone Wi-Fi/cellular path changes explicitly rebind the account Cloud WebSocket.
+## RF5.2 corrections
 
-## Persistent command sequence
+- A validated RF5 protocol-v3 local WebSocket is now sufficient proof of Local Wi-Fi reachability.
+- The app no longer requires a separate HTTP `/api/status` success before promoting LAN when the v3 realtime socket is healthy.
+- Remote/Cloud remains usable through RF5's REST + semantic-ACK fallback while the iPhone account WebSocket is rebinding.
+- Route badges are rebuilt immediately when the app cloud socket connects/disconnects.
+- Backend device-online state is reconciled by REST after phone network-interface changes.
+- App cloud WebSocket authentication has a 6-second timeout/reconnect guard.
+- A 12-second Wi-Fi attachment grace prevents transient path-change misses from erasing the remembered local host.
+- RF5.1 remembered-brightness alias/BLE correction is retained.
+- RF5 ordered command/sequence logic is retained.
 
-The app stores a stable controller ID and persistent session/high-water sequence in UserDefaults. Sequence numbers are leased in blocks of **4096** so a crash/relaunch cannot normally reuse a previously transmitted sequence. A relaunch may therefore jump forward (for example 1 → 4097); that is intentional.
+## Compatibility
 
-## Build
+This iOS build works with the **RF5 firmware already flashed**. The RF5.1 firmware remains recommended separately because it fixes the saved-brightness 4% → 20% issue. No Render backend change is required for RF5.2.
 
-The Xcode project is in:
+## Physical test order
 
-`iosApp/SHLAMP.xcodeproj`
-
-Codemagic configuration is at `codemagic.yaml`.
-
-Static validation in this release passed Swift 5 parsing for all 19 Swift files and an extracted RF5 sequence-core type/execution test. A real Xcode/Codemagic Release build cannot be performed in the Linux validation environment and remains a release-gate test on your build system.
-
-## Deployment compatibility
-
-Deploy the matching RF5 Render backend first, then RF5 ESP firmware to one test lamp, then install this iOS build. RF5 ordering depends on all three layers understanding the ordered command/ACK contract. Do not mix this iOS app with RF4 firmware for production handover testing.
-
-See `RF5_RELEASE_NOTES.md` for the detailed changes and the outer bundle's `READ_ME_FIRST.md` for the exact hardware test sequence.
+1. BLE ON/OFF.
+2. Turn Bluetooth off while phone Wi-Fi stays on. Expect Local Wi-Fi quickly, not Offline.
+3. Turn phone Wi-Fi off with cellular on. Expect Cloud/Remote and working ON/OFF.
+4. Turn phone Wi-Fi on again. Expect Local Wi-Fi to return without a long Offline period.
+5. Repeat rapidly and after a long idle.

@@ -9,6 +9,7 @@ protocol BLELampManagerDelegate: AnyObject {
     func bleManager(_ manager: BLELampManager, didConnect lampID: String, peripheralID: UUID, name: String)
     func bleManager(_ manager: BLELampManager, didDisconnect peripheralID: UUID?)
     func bleManager(_ manager: BLELampManager, didReceive status: BLELampStatus)
+    func bleManager(_ manager: BLELampManager, didReceiveRememberedBrightness percent: Int, lampID: String)
     func bleManager(_ manager: BLELampManager, didReceiveBattery percent: Int, lampID: String)
     func bleManager(_ manager: BLELampManager, didReceiveWiFiStatus status: String)
     func bleManager(_ manager: BLELampManager, didReceivePowerMode mode: LampPowerMode)
@@ -61,6 +62,7 @@ final class BLELampManager: NSObject {
     private var writeInProgress = false
     private var connectedLampID = ""
     private var connectedName = ""
+    private var lastRememberedBrightness: Int?
     private var lastRSSI = -127
     private var rssiTask: Task<Void, Never>?
     private var initialStateRequested = false
@@ -391,6 +393,7 @@ final class BLELampManager: NSObject {
         savedAssemblies.removeAll()
         controllerAssemblies.removeAll()
         connectedLampID = ""
+        lastRememberedBrightness = nil
         lastRSSI = -127
         rssiTask?.cancel()
         rssiTask = nil
@@ -427,8 +430,25 @@ final class BLELampManager: NSObject {
 
     private func parseControlStatus(_ data: Data) {
         if parseOrderedAck(data) { return }
-        guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let regex = try? NSRegularExpression(pattern: "^P([01])B(\\d{3})C(\\d{3})F([0-3])T(\\d{5})$"),
+        guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+
+        // RF5.1 additive remembered-brightness notification. It stays separate
+        // from the proven legacy status packet so every notification remains
+        // within the default 20-byte ATT payload and older apps keep working.
+        if let regex = try? NSRegularExpression(pattern: "^L(\\d{3})$"),
+           let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)),
+           let range = Range(match.range(at: 1), in: text),
+           let value = Int(text[range]) {
+            let remembered = clamp(value, 1...100)
+            lastRememberedBrightness = remembered
+            let lampID = connectedLampID.isEmpty ? (lampID(fromName: connectedName) ?? "") : connectedLampID
+            Task { @MainActor in
+                delegate?.bleManager(self, didReceiveRememberedBrightness: remembered, lampID: lampID)
+            }
+            return
+        }
+
+        guard let regex = try? NSRegularExpression(pattern: "^P([01])B(\\d{3})C(\\d{3})F([0-3])T(\\d{5})$"),
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)),
               match.numberOfRanges == 6 else { return }
         func group(_ index: Int) -> String {
@@ -440,6 +460,7 @@ final class BLELampManager: NSObject {
             power: group(1) == "1",
             targetBrightness: clamp(Int(group(2)) ?? 0, 0...100),
             currentBrightness: clamp(Int(group(3)) ?? 0, 0...100),
+            rememberedBrightness: lastRememberedBrightness,
             fadeMode: clamp(Int(group(4)) ?? 2, 0...3),
             timerRemainingSeconds: Int64(max(0, Int(group(5)) ?? 0)),
             rssi: lastRSSI

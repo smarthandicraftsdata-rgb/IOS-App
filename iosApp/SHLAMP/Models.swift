@@ -329,6 +329,9 @@ struct BLELampStatus: Equatable {
     let power: Bool
     let targetBrightness: Int
     let currentBrightness: Int
+    /// RF5.1 firmware reports the device's actual saved non-zero brightness.
+    /// Nil keeps compatibility with older firmware status packets.
+    let rememberedBrightness: Int?
     let fadeMode: Int
     let timerRemainingSeconds: Int64
     let rssi: Int

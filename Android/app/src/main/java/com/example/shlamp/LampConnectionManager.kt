@@ -1647,17 +1647,34 @@ internal class LampConnectionManager(
             },
             isOn = status.power,
             brightness = status.targetBrightness,
-            lastNonZeroBrightness = if (status.targetBrightness > 0) {
-                status.targetBrightness
-            } else {
-                existing.lastNonZeroBrightness
-            },
+            lastNonZeroBrightness = status.rememberedBrightness
+                ?: if (status.targetBrightness > 0) {
+                    status.targetBrightness
+                } else {
+                    existing.lastNonZeroBrightness
+                },
             fadeMode = status.fadeMode,
             timerRemainingSeconds = status.timerRemainingSeconds,
             bleRssi = status.rssi,
             lastSeenAt = System.currentTimeMillis()
         )
         upsertLamp(updated, persist = false)
+    }
+
+    override fun onBleRememberedBrightness(lampId: String, percent: Int) {
+        val resolvedLampId = resolveKnownLampId(lampId)
+        val existing = _lamps.value.firstOrNull {
+            it.lampId.equals(resolvedLampId, ignoreCase = true) ||
+                it.lampId.equals(lampId, ignoreCase = true)
+        } ?: selectedLamp() ?: return
+        upsertLamp(
+            existing.copy(
+                lampId = resolvedLampId,
+                lastNonZeroBrightness = percent.coerceIn(1, 100),
+                lastSeenAt = System.currentTimeMillis()
+            ),
+            persist = false
+        )
     }
 
     override fun onBleBatteryLevel(lampId: String, percent: Int) {
