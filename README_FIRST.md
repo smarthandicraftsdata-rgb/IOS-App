@@ -1,18 +1,26 @@
-# SH Lamp iOS 1.7.9 (21) — RF5.3 Cloud Slider Stability
+# SH Lamp iOS 1.8.1 (23) — RF5.4.1 Hardware Acceptance Candidate
 
-This build is based directly on RF5.2.2 Token Recovery and therefore retains:
-- RF5.2 Local Wi-Fi route recovery,
-- RF5.2.1 LAN/BLE self-healing connection supervisor,
-- RF5.2.2 JWT refresh before /ws/app reconnect,
-- RF5 ordered cross-transport commands and semantic ACK handling.
+Use this project with the matching RF5.4.1 Render backend and ESP32 firmware.
 
-## RF5.3 change
+RF5.4.1 retains RF5 ordered controller/session/sequence semantics and RF5.4 same-ID route hedging, then adds the local-route lifecycle/identity hardening required by the RF5.3 field logs:
 
-The physical test showed a reproducible trigger: while Remote/Cloud control was healthy, dragging brightness rapidly produced a burst of ordered `setOutputState` frames and was immediately followed by ESP device-WebSocket disconnects while router Wi-Fi remained associated.
+- Automatic command priority remains BLE > Local Wi-Fi > Cloud.
+- Same logical command can be hedged across routes without duplicate physical execution.
+- BLE ordered protocol and ACK path are unchanged from RF5.4.
+- Local WebSocket ownership is limited to one starting/healthy generation per expected physical lamp before identity arrives.
+- A local host is command-healthy only when the state received from that host identifies the expected lamp.
+- Ordered HTTP fallback performs a bounded identity status probe before mutation, preventing stale DHCP/IP reuse from controlling a different lamp.
+- Wi-Fi loss uses make-before-break route selection, so a healthy BLE/Cloud route does not unnecessarily pass through Offline.
+- LAN and Cloud control waits remain short and independent; no fixed Cloud→LAN time fence is used.
 
-RF5.3 reduces only intermediate Cloud slider traffic:
-- BLE/LAN streaming remains 100 ms (10 Hz).
-- Cloud streaming is coalesced to 250 ms (4 Hz).
-- Slider release still sends one immediate durable ordered command and waits for the ESP semantic ACK.
+Version: 1.8.1
+Build: 23
+Codemagic workflow: ios-unsigned-sideloadly
 
-Use together with the RF5.3 Render backend and RF5.3 ESP firmware. The backend/firmware add the `ephemeral: true` live-slider contract; running this app with older backend/firmware is safe but does not receive the full traffic reduction.
+Validation performed in this environment:
+- Swift parser: 19/19 files
+- project integrity verifier: PASS
+- release auditor: PASS
+- deterministic routing/state/backend playgrounds: PASS
+
+Not performed here: Apple SDK/Xcode signed build or physical iPhone installation. Those remain hardware-acceptance gates.

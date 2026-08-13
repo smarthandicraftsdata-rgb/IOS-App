@@ -1,6 +1,6 @@
 import Foundation
 
-enum LampConnectionRoute: String, Codable, CaseIterable {
+enum LampConnectionRoute: String, Codable, CaseIterable, Sendable {
     case offline
     case bluetooth
     case wifi

@@ -74,7 +74,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         action: String,
         value: Any,
         commandID: String,
-        timeout: TimeInterval = 2.4
+        timeout: TimeInterval = 0.75
     ) async throws -> JSONObject {
         let expectedLampID = lampID.uppercased()
         return try await withCheckedThrowingContinuation { continuation in
@@ -183,7 +183,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         candidateIndex += 1
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("SHLAMP-iOS/1.7.9-RF5.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.1-RF5.4.1", forHTTPHeaderField: "User-Agent")
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Connecting live cloud…", connected: false) }
         let newTask = session.webSocketTask(with: request)
         task = newTask
@@ -349,7 +349,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         // indefinite Offline/Authenticating state.
         authTimeoutTask?.cancel()
         authTimeoutTask = Task { [weak self, weak webSocketTask] in
-            try? await Task.sleep(for: .seconds(6))
+            try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled, let self, let webSocketTask, self.task === webSocketTask else { return }
             self.handleSocketFailure(webSocketTask, status: "Cloud authentication timed out. Reconnecting…")
         }

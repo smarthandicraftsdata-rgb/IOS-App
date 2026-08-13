@@ -120,6 +120,23 @@ private final class ControllerIntentSequenceStore {
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    private struct RouteHealthState {
+        var consecutiveFailures = 0
+        var lastAckAt: Date?
+        var lastAckLatencyMs: Double?
+        var degradedUntil: Date?
+    }
+
+    private enum OrderedRouteAttemptOutcome: Sendable {
+        case success(LampConnectionRoute)
+        case failure(String)
+        case skipped
+    }
+
+    private enum CloudAttemptOutcome: Sendable {
+        case success
+        case failure(String)
+    }
     @Published var currentUser: CloudUser?
     @Published var dashboard: Dashboard = .empty
     @Published var lamps: [LampRecord] = []
@@ -203,7 +220,8 @@ final class AppViewModel: ObservableObject {
     private var lastCloudMutationAt: [String: Date] = [:]
     private var pendingCloudMutationCommands: [String: String] = [:]
     private var latestCloudMutationCommandByLampID: [String: String] = [:]
-    private let cloudToLanFence: TimeInterval = 2.25
+    private var routeHealth: [String: RouteHealthState] = [:]
+    private let routeHedgeDelayMs = 180
 
     private let wifiHealthTTL: TimeInterval = 7
     private let wifiTransitionGrace: TimeInterval = 12
@@ -370,8 +388,9 @@ final class AppViewModel: ObservableObject {
 
     func startConnections() {
         local.startDiscovery()
-        for host in Set(localRecords.values.compactMap(\.localHost)) {
-            local.startRealtime(host: host)
+        for record in localRecords.values {
+            guard let host = record.localHost else { continue }
+            local.startRealtime(host: host, expectedLampID: record.id)
         }
         if !manualAddFlowActive { ble.startScan() }
         if let token = session?.accessToken {
@@ -592,7 +611,8 @@ final class AppViewModel: ObservableObject {
                 try await performOrderedRouted(
                     lamp: lamp,
                     intent: ordered,
-                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "output") }
+                    generation: generation,
+                    field: "output"
                 )
             } catch { handle(error) }
         }
@@ -623,7 +643,8 @@ final class AppViewModel: ObservableObject {
                 try await performOrderedRouted(
                     lamp: lamp,
                     intent: ordered,
-                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "output") }
+                    generation: generation,
+                    field: "output"
                 )
             } catch { handle(error) }
         }
@@ -686,7 +707,7 @@ final class AppViewModel: ObservableObject {
             case .wifi:
                 guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
                 do {
-                    _ = try await local.sendOrderedCommand(host: host, intent: intent, waitForAck: false)
+                    _ = try await local.sendOrderedCommand(host: host, expectedLampID: lamp.id, intent: intent, waitForAck: false)
                     return .wifi
                 } catch {
                     markWiFiFailure(for: lamp)
@@ -810,7 +831,8 @@ final class AppViewModel: ObservableObject {
                 try await performOrderedRouted(
                     lamp: lamp,
                     intent: ordered,
-                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "fade") }
+                    generation: generation,
+                    field: "fade"
                 )
             } catch { handle(error) }
         }
@@ -834,7 +856,8 @@ final class AppViewModel: ObservableObject {
                 try await performOrderedRouted(
                     lamp: lamp,
                     intent: ordered,
-                    shouldContinue: { self.isCurrentControlIntent(generation, for: lamp, field: "timer") }
+                    generation: generation,
+                    field: "timer"
                 )
             } catch { handle(error) }
         }
@@ -991,81 +1014,197 @@ final class AppViewModel: ObservableObject {
     private func performOrderedRouted(
         lamp: LampRecord,
         intent: OrderedControlIntent,
-        shouldContinue: (() -> Bool)? = nil
+        generation: Int,
+        field: String
     ) async throws {
-        let order = routeOrder(for: lamp)
-        var lastFailure: Error?
+        guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+        let currentLamp = freshestLampRecord(for: lamp)
+        let orderedRoutes = routeOrder(for: currentLamp).filter { $0 != .offline }
+        // Already-usable routes go first so Cloud is not artificially delayed
+        // when BLE/LAN are absent. Routes that are currently unavailable still
+        // get a later hedge slot: if LAN comes up while a Cloud command is
+        // pending, that SAME logical command can move to LAN without waiting for
+        // the Cloud timeout. An unavailable route is skipped, not counted as a
+        // semantic failure.
+        let available = orderedRoutes.filter { routeCanBeAttempted($0, lamp: currentLamp) }
+        let unavailable = orderedRoutes.filter { !routeCanBeAttempted($0, lamp: currentLamp) }
+        let candidates = available + unavailable
+        guard !candidates.isEmpty else {
+            throw AppError.message("No available connection could control this lamp.")
+        }
+        let commandStartedAt = Date()
+        print("RF5.4.1 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
 
-        for route in order {
-            if let shouldContinue, !shouldContinue() { return }
-            switch route {
-            case .wifi:
-                guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
-                do {
-                    let requestStartedAt = Date()
-                    if let snapshot = try await local.sendOrderedCommand(host: host, intent: intent, waitForAck: true) {
-                        if let shouldContinue, !shouldContinue() { return }
-                        apply(snapshot: snapshot, observedAt: requestStartedAt, authoritative: true)
+        // RF5.4 route hedging: do not wait for one transport's multi-second
+        // timeout before trying another already-known healthy path. The same
+        // command ID + controller/session/sequence is sent on every hedge, so
+        // ESP-side idempotency/order protection guarantees at-most-once
+        // physical execution even if two routes deliver it.
+        let outcome = await withTaskGroup(of: OrderedRouteAttemptOutcome.self, returning: OrderedRouteAttemptOutcome.self) { group in
+            for (index, route) in candidates.enumerated() {
+                let delayMs = index * routeHedgeDelayMs
+                group.addTask { [weak self] in
+                    guard let self else { return .skipped }
+                    if delayMs > 0 {
+                        try? await Task.sleep(for: .milliseconds(delayMs))
                     }
-                    return
-                } catch {
-                    if let shouldContinue, !shouldContinue() { return }
-                    lastFailure = error
-                    markWiFiFailure(for: lamp)
-                }
-
-            case .bluetooth:
-                guard canUseBLE(lamp) else { continue }
-                do {
-                    try await ble.sendOrdered(intent: intent, waitForAck: true)
-                    if let shouldContinue, !shouldContinue() { return }
-                    updateLocalRecord(for: lamp) { $0.route = .bluetooth; $0.online = true }
-                    return
-                } catch {
-                    if let shouldContinue, !shouldContinue() { return }
-                    lastFailure = error
-                }
-
-            case .cloud:
-                guard isCloudHealthy(lamp) else { continue }
-                do {
-                    let remoteID = try remoteID(for: lamp)
-                    try await sendCloudOrderedCommand(lampID: remoteID, intent: intent)
-                    if let shouldContinue, !shouldContinue() { return }
-                    updateLocalRecord(for: lamp) { record in
-                        if record.route == .offline { record.online = true }
+                    guard !Task.isCancelled else { return .skipped }
+                    let stillCurrent = await self.isCurrentControlIntent(generation, for: lamp, field: field)
+                    guard stillCurrent else { return .skipped }
+                    let liveLamp = await self.freshestLampRecord(for: lamp)
+                    let canAttempt = await self.routeCanBeAttempted(route, lamp: liveLamp)
+                    guard canAttempt else { return .skipped }
+                    do {
+                        let successfulRoute = try await self.attemptOrderedRoute(route, lamp: lamp, intent: intent)
+                        return .success(successfulRoute)
+                    } catch {
+                        return .failure(error.localizedDescription)
                     }
-                    return
-                } catch {
-                    if let shouldContinue, !shouldContinue() { return }
-                    lastFailure = error
                 }
-
-            case .offline:
-                continue
             }
+
+            var lastFailure = "No available connection could control this lamp."
+            while let result = await group.next() {
+                switch result {
+                case .success:
+                    group.cancelAll()
+                    return result
+                case .failure(let message):
+                    if !message.isEmpty { lastFailure = message }
+                case .skipped:
+                    break
+                }
+            }
+            return .failure(lastFailure)
         }
 
-        throw lastFailure ?? AppError.message("No available connection could control this lamp.")
+        guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+        switch outcome {
+        case .success(let route):
+            print("RF5.4.1 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
+            updateLocalRecord(for: lamp) { record in
+                record.route = route
+                record.online = true
+            }
+        case .failure(let message):
+            throw AppError.message(message)
+        case .skipped:
+            return
+        }
+    }
+
+    private func attemptOrderedRoute(
+        _ route: LampConnectionRoute,
+        lamp: LampRecord,
+        intent: OrderedControlIntent
+    ) async throws -> LampConnectionRoute {
+        let target = freshestLampRecord(for: lamp)
+        let startedAt = Date()
+        print("RF5.4.1 CMD app_send id=\(intent.commandID) route=\(route.rawValue) action=\(intent.action)")
+        do {
+            switch route {
+            case .wifi:
+                guard isWiFiHealthy(target), let host = target.localHost else {
+                    throw AppError.message("Local Wi-Fi is not currently reachable.")
+                }
+                let requestStartedAt = Date()
+                if let snapshot = try await local.sendOrderedCommand(host: host, expectedLampID: target.id, intent: intent, waitForAck: true) {
+                    apply(snapshot: snapshot, observedAt: requestStartedAt, authoritative: true)
+                }
+            case .bluetooth:
+                guard canUseBLE(target) else {
+                    throw AppError.message("Bluetooth is not ready for this lamp.")
+                }
+                try await ble.sendOrdered(intent: intent, waitForAck: true)
+            case .cloud:
+                guard isCloudHealthy(target) else {
+                    throw AppError.message("Remote cloud route is not currently reachable.")
+                }
+                let remoteID = try remoteID(for: target)
+                try await sendCloudOrderedCommand(lampID: remoteID, intent: intent)
+            case .offline:
+                throw AppError.message("Offline is not a control route.")
+            }
+            noteRouteSuccess(route, lamp: target, startedAt: startedAt)
+            print("RF5.4.1 CMD app_ack id=\(intent.commandID) route=\(route.rawValue) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+            return route
+        } catch {
+            print("RF5.4.1 CMD app_fail id=\(intent.commandID) route=\(route.rawValue) after=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms error=\(error.localizedDescription)")
+            noteRouteFailure(route, lamp: target)
+            if route == .wifi { markWiFiFailure(for: target) }
+            throw error
+        }
     }
 
     private func routeOrder(for lamp: LampRecord) -> [LampConnectionRoute] {
+        let base: [LampConnectionRoute]
         switch lamp.routePreference {
         case .remote:
+            // Strict Remote preference remains Cloud-only by user choice.
             return [.cloud]
         case .bluetooth:
-            return [.bluetooth, .wifi, .cloud]
+            base = [.bluetooth, .wifi, .cloud]
         case .wifi:
-            return [.wifi, .bluetooth, .cloud]
+            base = [.wifi, .bluetooth, .cloud]
         case .automatic:
-            let preferred = automaticLocalRoute(for: lamp)
-            switch preferred {
-            case .bluetooth: return [.bluetooth, .wifi, .cloud]
-            case .wifi: return [.wifi, .bluetooth, .cloud]
-            case .cloud: return [.cloud, .bluetooth, .wifi]
-            case .offline: return [.bluetooth, .wifi, .cloud]
-            }
+            // Production priority is semantic-health BLE > LAN > Cloud. RSSI is
+            // diagnostic information, not a reason to abandon an ACK-healthy
+            // BLE path. Circuit-breaker failures below can still demote it.
+            base = [.bluetooth, .wifi, .cloud]
         }
+
+        // A route that has missed two semantic ACKs is moved behind healthy
+        // alternatives for a short probe window, rather than forcing every new
+        // command to pay the same timeout. It is not permanently disabled.
+        let now = Date()
+        let healthy = base.filter { !isRouteCircuitOpen($0, lamp: lamp, now: now) }
+        let degraded = base.filter { isRouteCircuitOpen($0, lamp: lamp, now: now) }
+        return healthy + degraded
+    }
+
+    private func routeCanBeAttempted(_ route: LampConnectionRoute, lamp: LampRecord) -> Bool {
+        switch route {
+        case .bluetooth: return canUseBLE(lamp)
+        case .wifi: return isWiFiHealthy(lamp)
+        case .cloud: return isCloudHealthy(lamp)
+        case .offline: return false
+        }
+    }
+
+    private func routeHealthKey(_ route: LampConnectionRoute, lamp: LampRecord) -> String {
+        "\(lamp.canonicalID.uppercased())|\(route.rawValue)"
+    }
+
+    private func isRouteCircuitOpen(_ route: LampConnectionRoute, lamp: LampRecord, now: Date = Date()) -> Bool {
+        guard let until = routeHealth[routeHealthKey(route, lamp: lamp)]?.degradedUntil else { return false }
+        return until > now
+    }
+
+    private func noteRouteSuccess(_ route: LampConnectionRoute, lamp: LampRecord, startedAt: Date) {
+        let key = routeHealthKey(route, lamp: lamp)
+        var health = routeHealth[key] ?? RouteHealthState()
+        health.consecutiveFailures = 0
+        health.lastAckAt = Date()
+        health.lastAckLatencyMs = Date().timeIntervalSince(startedAt) * 1000
+        health.degradedUntil = nil
+        routeHealth[key] = health
+    }
+
+    private func noteRouteFailure(_ route: LampConnectionRoute, lamp: LampRecord) {
+        let key = routeHealthKey(route, lamp: lamp)
+        var health = routeHealth[key] ?? RouteHealthState()
+        health.consecutiveFailures += 1
+        if health.consecutiveFailures >= 2 {
+            let cooldown: TimeInterval
+            switch route {
+            case .bluetooth: cooldown = 2
+            case .wifi: cooldown = 3
+            case .cloud: cooldown = 5
+            case .offline: cooldown = 0
+            }
+            health.degradedUntil = Date().addingTimeInterval(cooldown)
+        }
+        routeHealth[key] = health
     }
 
     private func isCloudHealthy(_ lamp: LampRecord) -> Bool {
@@ -1084,29 +1223,8 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    /// BLE is preferred while it is genuinely healthy. Hysteresis prevents a
-    /// lamp near the range boundary from bouncing BLE <-> LAN every few RSSI
-    /// samples. Unknown RSSI immediately after connection still prefers BLE.
-    private func automaticLocalRoute(for lamp: LampRecord) -> LampConnectionRoute {
-        let hasBLE = canUseBLE(lamp)
-        let hasWiFi = isWiFiHealthy(lamp)
-        guard hasBLE || hasWiFi else {
-            return isCloudHealthy(lamp) ? .cloud : .offline
-        }
-        guard hasBLE else { return .wifi }
-        guard hasWiFi else { return .bluetooth }
-
-        let rssi = lamp.bleRSSI
-        if rssi <= -120 { return .bluetooth } // waiting for first RSSI read
-
-        if lamp.route == .bluetooth {
-            return rssi <= -82 ? .wifi : .bluetooth
-        }
-        if lamp.route == .wifi {
-            return rssi >= -70 ? .bluetooth : .wifi
-        }
-        return rssi >= -78 ? .bluetooth : .wifi
-    }
+    // RF5.4 automatic routing uses fixed semantic-health priority:
+    // BLE > Local Wi-Fi > Cloud. RSSI remains available for diagnostics.
 
     private func markWiFiFailure(for lamp: LampRecord) {
         let key = lamp.id.uppercased()
@@ -1178,7 +1296,7 @@ final class AppViewModel: ObservableObject {
                             // transport. A validated realtime state therefore
                             // proves the current Wi-Fi path by itself; an extra
                             // HTTP status probe is no longer required.
-                            if self.local.isRealtimeHealthy(host: host) { continue }
+                            if self.local.isRealtimeHealthy(host: host, expectedLampID: record.id) { continue }
                             guard !self.localPollInFlight.contains(key) else { continue }
                             self.localPollInFlight.insert(key)
                             Task { @MainActor [weak self] in
@@ -1206,7 +1324,7 @@ final class AppViewModel: ObservableObject {
         // A live protocol-v3 socket is stronger evidence than a single HTTP
         // timeout. Do not let a transient HTTP miss tear down a working LAN
         // route or erase the remembered host.
-        if let host = lamp.localHost, local.isRealtimeHealthy(host: host) {
+        if let host = lamp.localHost, local.isRealtimeHealthy(host: host, expectedLampID: lamp.id) {
             localFailureCounts[key] = 0
             rebuildLamps()
             return
@@ -1270,7 +1388,7 @@ final class AppViewModel: ObservableObject {
         if wifiPathAvailable {
             for record in localCandidates.prefix(2) {
                 guard let host = record.localHost, !isWiFiHealthy(record, now: now) else { continue }
-                local.recoverRealtime(host: host)
+                local.recoverRealtime(host: host, expectedLampID: record.id)
             }
 
             if localCandidates.contains(where: { !isWiFiHealthy($0, now: now) }),
@@ -1314,14 +1432,10 @@ final class AppViewModel: ObservableObject {
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
         guard wifiPathAvailable, let host = lamp.localHost else { return false }
         let keys = stateKeys(for: lamp)
-        // RF4: do not cross from Cloud to LAN while a recent cloud mutation can
-        // still be in flight. The backend RF4 control TTL is 2 seconds; this
-        // small extra margin closes the handover race without delaying normal
-        // LAN operation once the transition has settled.
-        if let lastCloudMutation = keys.compactMap({ lastCloudMutationAt[$0] }).max(),
-           now.timeIntervalSince(lastCloudMutation) < cloudToLanFence {
-            return false
-        }
+        // RF5.4: there is deliberately NO Cloud→LAN time fence. Every ordered
+        // route carries the same controller/session/sequence identity, so an
+        // older delayed Cloud delivery is rejected by the ESP. A healthy LAN
+        // route must be usable immediately instead of waiting 2.25 seconds.
 
         // RF5.2: protocol v3 changed the local WebSocket from Phase-A
         // state-only transport into an ordered command channel with semantic
@@ -1331,7 +1445,7 @@ final class AppViewModel: ObservableObject {
         // Requiring a separate HTTP success here was the reason the video could
         // show Offline even while the ESP logged a connected local realtime
         // client.
-        if local.isRealtimeHealthy(host: host, now: now) { return true }
+        if local.isRealtimeHealthy(host: host, expectedLampID: lamp.id, now: now) { return true }
 
         // If realtime is unavailable, retain the bounded HTTP liveness fallback.
         guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else { return false }
@@ -1442,43 +1556,90 @@ final class AppViewModel: ObservableObject {
             }
         }
 
-        // Prefer the authenticated app WebSocket and require the actual ESP ACK.
-        // A Render `commandAccepted` frame only proves queueing, not execution.
+        // RF5.4 same-ID cloud hedge. A half-dead /ws/app path gets only a
+        // 220 ms head start; REST status verification begins in parallel rather
+        // than after a 2.4 s WebSocket timeout. Both paths refer to the exact
+        // same durable command, so Render/ESP idempotency makes the race safe.
         if cloudConnected {
-            do {
-                let ack = try await realtime.sendCommandAwaitingAck(
-                    lampID: normalizedLampID,
-                    action: intent.action,
-                    value: intent.value,
-                    commandID: intent.commandID,
-                    timeout: 2.4
-                )
-                if ack.bool("success") == false {
-                    throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
+            let outcome = await withTaskGroup(of: CloudAttemptOutcome.self, returning: CloudAttemptOutcome.self) { group in
+                group.addTask { [weak self] in
+                    guard let self else { return .failure("Cloud controller was released.") }
+                    do {
+                        try await self.sendCloudWebSocketOrderedCommand(lampID: normalizedLampID, intent: intent)
+                        return .success
+                    } catch {
+                        return .failure(error.localizedDescription)
+                    }
                 }
+                group.addTask { [weak self] in
+                    guard let self else { return .failure("Cloud controller was released.") }
+                    try? await Task.sleep(for: .milliseconds(220))
+                    guard !Task.isCancelled else { return .failure("Cloud REST hedge cancelled.") }
+                    do {
+                        try await self.sendCloudRESTOrderedCommand(lampID: normalizedLampID, intent: intent)
+                        return .success
+                    } catch {
+                        return .failure(error.localizedDescription)
+                    }
+                }
+
+                var lastFailure = "The lamp did not acknowledge the cloud command."
+                while let result = await group.next() {
+                    switch result {
+                    case .success:
+                        group.cancelAll()
+                        return .success
+                    case .failure(let message):
+                        if !message.isEmpty { lastFailure = message }
+                    }
+                }
+                return .failure(lastFailure)
+            }
+
+            switch outcome {
+            case .success:
                 lastCloudMutationAt.removeValue(forKey: normalizedLampID)
                 return
-            } catch {
-                // Retry the exact same command ID through REST. If the device
-                // already executed it and only the app ACK was lost, backend
-                // idempotency + ESP deduplication turn this into a status check.
+            case .failure(let message):
+                throw AppError.message(message)
             }
         }
 
+        try await sendCloudRESTOrderedCommand(lampID: normalizedLampID, intent: intent)
+        lastCloudMutationAt.removeValue(forKey: normalizedLampID)
+    }
+
+    private func sendCloudWebSocketOrderedCommand(lampID: String, intent: OrderedControlIntent) async throws {
+        let startedAt = Date()
+        let ack = try await realtime.sendCommandAwaitingAck(
+            lampID: lampID,
+            action: intent.action,
+            value: intent.value,
+            commandID: intent.commandID,
+            timeout: 0.75
+        )
+        if ack.bool("success") == false {
+            throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
+        }
+        print("RF5.4.1 CMD cloud_ws_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+    }
+
+    private func sendCloudRESTOrderedCommand(lampID: String, intent: OrderedControlIntent) async throws {
+        let startedAt = Date()
         let ack = try await withAccessToken { token in
             try await api.sendCommandAndWaitForAck(
                 accessToken: token,
-                lampId: normalizedLampID,
+                lampId: lampID,
                 action: intent.action,
                 value: intent.value,
                 commandID: intent.commandID,
-                timeout: 2.6
+                timeout: 1.6
             )
         }
         if ack.bool("success") == false {
             throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
         }
-        lastCloudMutationAt.removeValue(forKey: normalizedLampID)
+        print("RF5.4.1 CMD cloud_rest_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
     }
 
     private func sendCloudCommand(lampID: String, action: String, value: Any) async throws {
@@ -1589,7 +1750,7 @@ final class AppViewModel: ObservableObject {
                     let remembered = Array(self.localRecords.values.filter { $0.localHost != nil })
                     for record in remembered {
                         guard let host = record.localHost else { continue }
-                        self.local.startRealtime(host: host)
+                        self.local.startRealtime(host: host, expectedLampID: record.id)
                         let key = record.id.uppercased()
                         guard !self.localPollInFlight.contains(key) else { continue }
                         self.localPollInFlight.insert(key)
@@ -1618,7 +1779,13 @@ final class AppViewModel: ObservableObject {
                     self.wifiConfirmedAt.removeAll()
                     for key in Array(self.localRecords.keys) {
                         guard var record = self.localRecords[key], record.route == .wifi else { continue }
-                        record.route = self.canUseBLE(record) ? .bluetooth : .offline
+                        let cloud = record.cloudLampId.flatMap { cloudID in
+                            self.dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+                        }
+                        // Make-before-break route ownership: Wi-Fi disappearing
+                        // does not force a transient Offline badge while BLE or
+                        // an authenticated/online Cloud path is already usable.
+                        record.route = self.selectedRoute(for: record, local: record, cloud: cloud)
                         record.online = record.route != .offline
                         self.localRecords[key] = record
                     }
@@ -1843,7 +2010,7 @@ final class AppViewModel: ObservableObject {
         let stateObservedAt = authoritative ? receivedAt : observedAt
         localSnapshots[localID] = snapshot
         rememberedBrightnessByLamp[localID] = max(1, min(100, snapshot.lastBrightness))
-        local.startRealtime(host: snapshot.host)
+        local.startRealtime(host: snapshot.host, expectedLampID: snapshot.lampId)
         if confirmsWiFiCommandPath {
             wifiConfirmedAt[localID] = receivedAt
             localFailureCounts[localID] = 0
@@ -2087,11 +2254,13 @@ final class AppViewModel: ObservableObject {
             if hasBLE { return .bluetooth }
             if hasCloud { return .cloud }
         case .automatic:
-            if let local {
-                let preferred = automaticLocalRoute(for: local)
-                if preferred == .bluetooth && hasBLE { return .bluetooth }
-                if preferred == .wifi && hasWiFi { return .wifi }
-            }
+            let healthLamp = local ?? lamp
+            if hasBLE && !isRouteCircuitOpen(.bluetooth, lamp: healthLamp) { return .bluetooth }
+            if hasWiFi && !isRouteCircuitOpen(.wifi, lamp: healthLamp) { return .wifi }
+            if hasCloud && !isRouteCircuitOpen(.cloud, lamp: lamp) { return .cloud }
+            // Never manufacture an Offline gap merely because a route is in a
+            // short circuit-breaker cooldown. Keep the best connected fallback
+            // visible while its health probe recovers.
             if hasBLE { return .bluetooth }
             if hasWiFi { return .wifi }
             if hasCloud { return .cloud }

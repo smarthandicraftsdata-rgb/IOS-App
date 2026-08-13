@@ -9,6 +9,7 @@ struct HTTPResult {
 final class CloudAPI {
     private let baseURL: URL
     private let session: URLSession
+    private let controlSession: URLSession
 
     init(baseURL: URL = AppEnvironment.cloudBaseURL) {
         self.baseURL = baseURL
@@ -17,6 +18,14 @@ final class CloudAPI {
         configuration.timeoutIntervalForResource = 30
         configuration.waitsForConnectivity = true
         self.session = URLSession(configuration: configuration)
+
+        // Commands must never inherit a 20-30 second ordinary API wait. This
+        // session is used only by the same-ID semantic-ACK control hedge.
+        let controlConfiguration = URLSessionConfiguration.ephemeral
+        controlConfiguration.timeoutIntervalForRequest = 1.15
+        controlConfiguration.timeoutIntervalForResource = 1.5
+        controlConfiguration.waitsForConnectivity = false
+        self.controlSession = URLSession(configuration: controlConfiguration)
     }
 
     func signIn(email: String, password: String) async throws -> (CloudUser, CloudSession) {
@@ -224,7 +233,7 @@ final class CloudAPI {
         ]
         var lastError = "Cloud command endpoint was not found."
         for path in paths {
-            let result = try await request(method: "POST", path: path, body: body, token: accessToken, acceptErrors: true)
+            let result = try await request(method: "POST", path: path, body: body, token: accessToken, acceptErrors: true, controlPath: true)
             if result.status == 401 || result.status == 403 { throw AppError.unauthorized }
             if (200...299).contains(result.status) {
                 guard !result.data.isEmpty, let root = try? parseJSONObject(result.data) else { return "Command queued." }
@@ -259,7 +268,8 @@ final class CloudAPI {
             path: "/api/devices/\(id)/commands",
             body: body,
             token: accessToken,
-            acceptErrors: true
+            acceptErrors: true,
+            controlPath: true
         )
         if submit.status == 401 || submit.status == 403 { throw AppError.unauthorized }
         guard (200...299).contains(submit.status) else { throw try error(from: submit) }
@@ -272,7 +282,8 @@ final class CloudAPI {
                 method: "GET",
                 path: "/api/devices/\(id)/commands/\(encodedCommandID)",
                 token: accessToken,
-                acceptErrors: true
+                acceptErrors: true,
+                controlPath: true
             )
             if result.status == 401 || result.status == 403 { throw AppError.unauthorized }
             if result.status == 404 {
@@ -300,17 +311,18 @@ final class CloudAPI {
         throw AppError.message("The lamp did not acknowledge the REST cloud command in time.")
     }
 
-    private func request(method: String, path: String, body: JSONObject? = nil, token: String? = nil, acceptErrors: Bool = false) async throws -> HTTPResult {
+    private func request(method: String, path: String, body: JSONObject? = nil, token: String? = nil, acceptErrors: Bool = false, controlPath: Bool = false) async throws -> HTTPResult {
         guard let url = URL(string: path, relativeTo: baseURL) else { throw AppError.message("Invalid cloud URL.") }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 30
+        request.timeoutInterval = controlPath ? 1.15 : 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.setValue("SHLAMP-iOS/1.7.9-RF5.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.1-RF5.4.1", forHTTPHeaderField: "User-Agent")
         if let token, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body { request.httpBody = try jsonData(body) }
-        let (data, response) = try await session.data(for: request)
+        let activeSession = controlPath ? controlSession : session
+        let (data, response) = try await activeSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw AppError.message("Cloud server did not return HTTP.") }
         let result = HTTPResult(status: http.statusCode, data: data, path: path)
         if !acceptErrors && !(200...299).contains(http.statusCode) { throw try error(from: result) }

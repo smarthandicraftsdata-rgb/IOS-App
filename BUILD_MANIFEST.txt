@@ -1,6 +1,13 @@
-SH Lamp iOS RF5.3 Cloud Slider Stability
-Version: 1.7.9
-Build: 21
-Baseline: iOS 1.7.8 build 20 RF5.2.2 Token Recovery
-Primary RF5.3 code change: iosApp/SHLAMP/AppViewModel.swift
-Supporting version headers: CloudRealtimeClient.swift, CloudAPI.swift, LocalLampController.swift, project.pbxproj
+SH Lamp iOS
+Version: 1.8.1
+Build: 23
+Candidate: RF5.4.1 Hardware Acceptance
+Target priority: BLE > Local Wi-Fi > Cloud
+Codemagic workflow: ios-unsigned-sideloadly
+Primary changed files:
+- iosApp/SHLAMP/AppViewModel.swift
+- iosApp/SHLAMP/LocalLampController.swift
+- iosApp/SHLAMP/CloudAPI.swift (version UA only relative to RF5.4)
+- iosApp/SHLAMP/CloudRealtimeClient.swift (version UA only relative to RF5.4)
+- iosApp/SHLAMP.xcodeproj/project.pbxproj
+BLELampManager.swift is byte-identical to RF5.4.

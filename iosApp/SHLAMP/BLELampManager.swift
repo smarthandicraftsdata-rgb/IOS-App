@@ -88,8 +88,8 @@ final class BLELampManager: NSObject {
 
     var connectedPeripheralID: UUID? { peripheral?.identifier }
     var isBluetoothPoweredOn: Bool { central.state == .poweredOn }
-    var isReady: Bool { isBluetoothPoweredOn && peripheral != nil && controlCharacteristic != nil }
-    var isConnecting: Bool { isBluetoothPoweredOn && peripheral != nil && controlCharacteristic == nil }
+    var isReady: Bool { isBluetoothPoweredOn && peripheral != nil && controlCharacteristic != nil && connectionSetupCompleted }
+    var isConnecting: Bool { isBluetoothPoweredOn && peripheral != nil && !connectionSetupCompleted }
     var isScanning: Bool { central.isScanning }
 
     func startScan() {
@@ -159,7 +159,7 @@ final class BLELampManager: NSObject {
             guard let self,
                   let target,
                   self.peripheral?.identifier == targetID,
-                  !self.isReady else { return }
+                  !self.connectionSetupCompleted else { return }
             self.central.cancelPeripheralConnection(target)
             self.clearConnection(keepPeripheral: false)
             self.publishStatus("Bluetooth reconnect timed out; retrying discovery…")
@@ -186,8 +186,8 @@ final class BLELampManager: NSObject {
     /// LAN and cloud. `commandID` is deterministically derived by the app from
     /// those fields, so the BLE frame does not need to carry a long UUID.
     func sendOrdered(intent: OrderedControlIntent, waitForAck: Bool) async throws {
-        guard let characteristic = controlCharacteristic else {
-            throw AppError.message("The lamp Bluetooth control is not ready.")
+        guard isReady, let characteristic = controlCharacteristic else {
+            throw AppError.message("The lamp Bluetooth control identity/setup is not ready.")
         }
         let packet = try orderedPacket(intent)
         let key = orderedAckKey(intent)
@@ -205,7 +205,7 @@ final class BLELampManager: NSObject {
 
         try await withCheckedThrowingContinuation { continuation in
             let timeout = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(1.3))
+                try? await Task.sleep(for: .milliseconds(800))
                 guard !Task.isCancelled, let self else { return }
                 self.failOrderedAck(key: key, error: AppError.message("The lamp did not acknowledge the Bluetooth command."))
             }

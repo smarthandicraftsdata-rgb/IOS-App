@@ -1,0 +1,7 @@
+RELEASE AUDIT PASSED
+- Legacy BLE/local API compatibility: passed
+- RF5.4 BLE identity gate: passed
+- RF5.4 route hedging/circuit breaker: passed
+- RF5.4 bounded LAN/Cloud control timeouts: passed
+- Version consistency: passed
+- Core source hash integrity: passed

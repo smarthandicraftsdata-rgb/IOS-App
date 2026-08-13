@@ -1,0 +1,7 @@
+PROJECT VERIFICATION PASSED
+Swift files: 19
+Swift source SHA-256: 6f57077ad8aaf19216c45d48e561e102f5da2e66d05de0f5bce0b403e7abd888
+iOS version: 1.8.0 (22)
+RF5.4 routing/control invariants: passed
+Core source integrity: passed
+Codemagic workflow: ios-unsigned-sideloadly
