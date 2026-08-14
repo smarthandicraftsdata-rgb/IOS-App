@@ -1,13 +1,13 @@
 {
   "AppEnvironment.swift": "0acb99e26618d4d4463a486c4b3ae575843fcdd44b7ac290cd300fa3aa0fc147",
-  "AppViewModel.swift": "4dfba924e9bf6a47ea3786452398a23f07c8663cd8e90fe67e132d4474ebf134",
+  "AppViewModel.swift": "a00071e99a0c6a0dd08d5d1fd365f10442a94336647262eb5741305d7a409db7",
   "BLELampManager.swift": "3e5d980d1cd4a0b92ef3a004dc2c90621c28deee56265f49c52bf19327217883",
-  "CloudAPI.swift": "ae4c56b7b9de6b7bd64d7404d3b5b1f08fb919b11de8451ecfc358e690d688b3",
-  "CloudRealtimeClient.swift": "282639ebdcc13608125bc059f3f606d69337710e15968d4c5742b1eb5f338946",
+  "CloudAPI.swift": "555fe54ba5beaaff42bc964891acbd3f047d260687fb697362c98c607a4e40b0",
+  "CloudRealtimeClient.swift": "6c7c8cbd2b92c786bc07d755f545ae165660eaec9f5f698b80ba8821324411f1",
   "JSONHelpers.swift": "d5a420ef78c7c78d1e1a1bf9ae0657042b04522530116347f8f21e20ca5c3688",
   "KeychainStore.swift": "713ded7841ed7c64976429dfe8b313f674bf38fa616c9f3331172f49b5bcc067",
   "LampQRParser.swift": "6d3bb8ca91417013de6cdfdc8a14561816d32b3a344a4d5bf82d9d17d9d234be",
-  "LocalLampController.swift": "f96a1d6cef01a4fef219b94678587c7dc43e8ea2e566d17de3eee58b86a708e1",
+  "LocalLampController.swift": "b142c26359456c6ea9e3796b2675b36f443b4a505a4388bc527739538629d8f0",
   "Models.swift": "1d6f3bf214bfb077786f9a749b73dfb4d78c6d6ab2673b8b6339f7eec8602246",
   "QRScannerView.swift": "741928fcca7710b914bb03a71ec02e5acd0c89d0598b6c5fa02d58c1df5ac682"
 }

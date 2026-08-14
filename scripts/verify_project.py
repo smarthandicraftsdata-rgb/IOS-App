@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IOS = ROOT / "iosApp" / "SHLAMP"
 PBX = ROOT / "iosApp" / "SHLAMP.xcodeproj" / "project.pbxproj"
 YAML = ROOT / "codemagic.yaml"
-HASHES = ROOT / "docs" / "RF5.4.2_SOURCE_SHA256.json"
+HASHES = ROOT / "docs" / "RF5.4.3_SOURCE_SHA256.json"
 errors: list[str] = []
 
 required = [
@@ -62,12 +62,12 @@ for swift_file in sorted(IOS.rglob("*.swift")):
         errors.append(f"Swift file not referenced by Xcode project: {swift_file.relative_to(ROOT)}")
 for expected in [
     "SHLAMP", "com.smarthandicrafts.shlamp", "IPHONEOS_DEPLOYMENT_TARGET = 17.0",
-    "MARKETING_VERSION = 1.8.2", "CURRENT_PROJECT_VERSION = 24",
+    "MARKETING_VERSION = 1.8.3", "CURRENT_PROJECT_VERSION = 25",
 ]:
     if expected not in pbx_text: errors.append(f"Xcode project is missing setting: {expected}")
-if pbx_text.count("MARKETING_VERSION = 1.8.2") != 2:
-    errors.append("Expected Debug and Release MARKETING_VERSION 1.8.1")
-if pbx_text.count("CURRENT_PROJECT_VERSION = 24") != 2:
+if pbx_text.count("MARKETING_VERSION = 1.8.3") != 2:
+    errors.append("Expected Debug and Release MARKETING_VERSION 1.8.3")
+if pbx_text.count("CURRENT_PROJECT_VERSION = 25") != 2:
     errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 24")
 
 try:
@@ -116,6 +116,8 @@ checks = {
         "Task.sleep(for: .milliseconds(220))", "same-ID cloud hedge",
         "record.route = self.selectedRoute(for: record, local: record, cloud: cloud)",
         "physicalLocalIDNormalized", "cloudIDNormalized", "setOutputState",
+        "durableDeliveryRetryDelaysMs = [0, 140, 320]", "reissuedForTransportRetry",
+        "RF5.4.3 CMD retry",
     ],
 }
 for name, snippets in checks.items():
@@ -151,7 +153,7 @@ sha = hashlib.sha256("".join(sorted(p.read_text() for p in swift_files)).encode(
 print("PROJECT VERIFICATION PASSED")
 print(f"Swift files: {len(swift_files)}")
 print(f"Swift source SHA-256: {sha}")
-print("iOS version: 1.8.2 (24)")
-print("RF5.4.2 routing/control invariants: passed")
+print("iOS version: 1.8.3 (25)")
+print("RF5.4.3 routing/control invariants: passed")
 print("Core source integrity: passed")
 print("Codemagic workflow: ios-unsigned-sideloadly")

@@ -286,7 +286,8 @@ struct LampRecord: Identifiable, Codable, Equatable {
     /// Stable app/UI identity. A linked Cloud ID remains canonical for account views,
     /// while transport-specific code must use physicalLocalIDNormalized/cloudIDNormalized.
     var canonicalID: String {
-        (cloudLampId?.isEmpty == false ? cloudLampId! : id).uppercased()
+        if let cloudID = cloudIDNormalized { return cloudID }
+        return id.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
 
     var physicalLocalIDNormalized: String? {

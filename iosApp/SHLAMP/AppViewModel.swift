@@ -25,9 +25,28 @@ struct OrderedControlIntent {
     let kind: OrderedIntentKind
     let action: String
     let value: JSONObject
+    let deliveryAttempt: UInt8
 
     var commandID: String {
-        "RF5-\(controllerID)-\(controllerSession)-\(intentSequence)-\(kind.commandSuffix)"
+        let base = "RF5-\(controllerID)-\(controllerSession)-\(intentSequence)-\(kind.commandSuffix)"
+        return deliveryAttempt == 0 ? base : "\(base)-R\(deliveryAttempt)"
+    }
+
+    /// RF5.4.3 Cloud-final reliability: a transport retry gets a fresh command
+    /// ID but keeps the exact controller/session/sequence/value. If the first
+    /// delivery actually reached the ESP and only its ACK was lost, the ESP's
+    /// ordered gate returns DUPLICATE without a second physical mutation. If
+    /// the first delivery never reached the ESP, the retry may apply normally.
+    func reissuedForTransportRetry(_ attempt: UInt8) -> OrderedControlIntent {
+        OrderedControlIntent(
+            controllerID: controllerID,
+            controllerSession: controllerSession,
+            intentSequence: intentSequence,
+            kind: kind,
+            action: action,
+            value: value,
+            deliveryAttempt: attempt
+        )
     }
 }
 
@@ -93,7 +112,8 @@ private final class ControllerIntentSequenceStore {
             intentSequence: nextSequence,
             kind: kind,
             action: action,
-            value: value
+            value: value,
+            deliveryAttempt: 0
         )
     }
 
@@ -222,6 +242,12 @@ final class AppViewModel: ObservableObject {
     private var latestCloudMutationCommandByLampID: [String: String] = [:]
     private var routeHealth: [String: RouteHealthState] = [:]
     private let routeHedgeDelayMs = 180
+    // RF5.4.3: only the latest logical intent is allowed to recover. Each
+    // recovery attempt keeps the same ordered sequence/value but uses a fresh
+    // command ID, so a timed-out/expired Render row cannot permanently strand
+    // a final OFF or slider-release value. A newer user intent increments the
+    // field generation and immediately cancels these retries.
+    private let durableDeliveryRetryDelaysMs = [0, 140, 320]
 
     private let wifiHealthTTL: TimeInterval = 7
     private let wifiTransitionGrace: TimeInterval = 12
@@ -1017,7 +1043,121 @@ final class AppViewModel: ObservableObject {
         throw lastFailure ?? AppError.message("No available connection could control this lamp.")
     }
 
+    private func refreshPendingHoldForRetry(_ lamp: LampRecord, intent: OrderedControlIntent) {
+        switch intent.kind {
+        case .output:
+            if let power = intent.value["power"] as? Bool {
+                setPendingPower(lamp, value: power, lifetime: 3.0)
+            }
+            if let brightness = intent.value["brightness"] as? Int {
+                setPendingBrightness(lamp, value: clamp(brightness, 0...100), lifetime: 3.0)
+            }
+        case .fade:
+            if let mode = intent.value["fadeMode"] as? Int {
+                setPendingFade(lamp, value: clamp(mode, 0...3), lifetime: 3.0)
+            }
+        case .timer:
+            if let minutes = intent.value["timerMinutes"] as? Int {
+                setPendingTimer(lamp, seconds: Int64(max(0, minutes) * 60), lifetime: 4.0)
+            }
+        }
+    }
+
+    /// RF5.4.3 retries DELIVERY failures, never semantic/programming failures.
+    /// COMMAND_EXPIRED is deliberately retryable: the retry gets a fresh
+    /// transport commandId/TTL while preserving the exact ordered
+    /// controller/session/sequence/value. The ESP therefore applies it only if
+    /// the original delivery never committed, returns DUPLICATE if it did, and
+    /// returns STALE if a newer user intent has already won.
+    private func shouldRetryOrderedDelivery(after error: Error) -> Bool {
+        if case AppError.unauthorized = error { return false }
+        return shouldRetryOrderedDelivery(message: error.localizedDescription)
+    }
+
+    private func shouldRetryOrderedDelivery(message: String) -> Bool {
+        let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !normalized.isEmpty else { return true }
+
+        // These are semantic/identity/input failures. Retrying the same intent
+        // cannot make them valid and would only add traffic or hide a real bug.
+        let nonRetryableMarkers = [
+            "STALE_INTENT",
+            "ORDERING_METADATA_INVALID",
+            "INVALID_INTENT_KIND",
+            "INVALID_OUTPUT_STATE",
+            "INVALID_POWER_VALUE",
+            "INVALID_BRIGHTNESS",
+            "INVALID_FADE_MODE",
+            "INVALID_TIMER",
+            "COMMAND_ID_INVALID",
+            "ACTION_MISSING",
+            "ACTION_NOT_SUPPORTED",
+            "TYPE_MISSING",
+            "WRONG_DEVICE",
+            "WRONG_LAMP",
+            "DIFFERENT LAMP",
+            "UNAUTHORIZED",
+            "FORBIDDEN",
+            "INVALID CONTROLLER",
+            "INVALID LAMP"
+        ]
+        if nonRetryableMarkers.contains(where: normalized.contains) { return false }
+
+        // Explicit expiry and all transport/ACK timeout/disconnect failures are
+        // recoverable while this is still the newest field generation.
+        return true
+    }
+
     private func performOrderedRouted(
+        lamp: LampRecord,
+        intent: OrderedControlIntent,
+        generation: Int,
+        field: String
+    ) async throws {
+        var lastError: Error?
+
+        for attemptIndex in durableDeliveryRetryDelaysMs.indices {
+            guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+
+            let delayMs = durableDeliveryRetryDelaysMs[attemptIndex]
+            if delayMs > 0 {
+                try? await Task.sleep(for: .milliseconds(delayMs))
+                guard !Task.isCancelled,
+                      isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+            }
+
+            let deliveryIntent = attemptIndex == 0
+                ? intent
+                : intent.reissuedForTransportRetry(UInt8(attemptIndex))
+
+            if attemptIndex > 0 {
+                // Keep optimistic UI ownership alive while the newest command
+                // is actively recovering. Matching authoritative ACK/state
+                // clears these holds immediately; a newer user intent cancels
+                // this recovery through the generation guard above.
+                refreshPendingHoldForRetry(lamp, intent: deliveryIntent)
+                print("RF5.4.3 CMD retry id=\(deliveryIntent.commandID) baseSeq=\(intent.intentSequence) attempt=\(attemptIndex)")
+            }
+
+            do {
+                try await performOrderedRoutedSingleAttempt(
+                    lamp: lamp,
+                    intent: deliveryIntent,
+                    generation: generation,
+                    field: field
+                )
+                return
+            } catch {
+                lastError = error
+                guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+                guard shouldRetryOrderedDelivery(after: error) else { throw error }
+            }
+        }
+
+        throw lastError ?? AppError.message("No available connection could control this lamp.")
+    }
+
+    private func performOrderedRoutedSingleAttempt(
         lamp: LampRecord,
         intent: OrderedControlIntent,
         generation: Int,
@@ -1039,7 +1179,7 @@ final class AppViewModel: ObservableObject {
             throw AppError.message("No available connection could control this lamp.")
         }
         let commandStartedAt = Date()
-        print("RF5.4.2 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
+        print("RF5.4.3 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
 
         // RF5.4 route hedging: do not wait for one transport's multi-second
         // timeout before trying another already-known healthy path. The same
@@ -1087,7 +1227,7 @@ final class AppViewModel: ObservableObject {
         guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
         switch outcome {
         case .success(let route):
-            print("RF5.4.2 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
+            print("RF5.4.3 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
             updateLocalRecord(for: lamp) { record in
                 record.route = route
                 record.online = true
@@ -1106,7 +1246,7 @@ final class AppViewModel: ObservableObject {
     ) async throws -> LampConnectionRoute {
         let target = freshestLampRecord(for: lamp)
         let startedAt = Date()
-        print("RF5.4.2 CMD app_send id=\(intent.commandID) route=\(route.rawValue) action=\(intent.action)")
+        print("RF5.4.3 CMD app_send id=\(intent.commandID) route=\(route.rawValue) action=\(intent.action)")
         do {
             switch route {
             case .wifi:
@@ -1135,10 +1275,10 @@ final class AppViewModel: ObservableObject {
                 throw AppError.message("Offline is not a control route.")
             }
             noteRouteSuccess(route, lamp: target, startedAt: startedAt)
-            print("RF5.4.2 CMD app_ack id=\(intent.commandID) route=\(route.rawValue) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+            print("RF5.4.3 CMD app_ack id=\(intent.commandID) route=\(route.rawValue) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
             return route
         } catch {
-            print("RF5.4.2 CMD app_fail id=\(intent.commandID) route=\(route.rawValue) after=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms error=\(error.localizedDescription)")
+            print("RF5.4.3 CMD app_fail id=\(intent.commandID) route=\(route.rawValue) after=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms error=\(error.localizedDescription)")
             noteRouteFailure(route, lamp: target)
             if route == .wifi { markWiFiFailure(for: target) }
             throw error
@@ -1629,7 +1769,7 @@ final class AppViewModel: ObservableObject {
         if ack.bool("success") == false {
             throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
         }
-        print("RF5.4.2 CMD cloud_ws_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+        print("RF5.4.3 CMD cloud_ws_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
     }
 
     private func sendCloudRESTOrderedCommand(lampID: String, intent: OrderedControlIntent) async throws {
@@ -1647,7 +1787,7 @@ final class AppViewModel: ObservableObject {
         if ack.bool("success") == false {
             throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
         }
-        print("RF5.4.2 CMD cloud_rest_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+        print("RF5.4.3 CMD cloud_rest_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
     }
 
     private func sendCloudCommand(lampID: String, action: String, value: Any) async throws {
@@ -2761,7 +2901,16 @@ extension AppViewModel: CloudRealtimeClientDelegate {
                 }
                 if object.bool("success") == false {
                     let message = firstNonBlank(object.string("error"), "The lamp rejected the cloud command.")
-                    errorMessage = message
+                    // A transient semantic delivery rejection such as
+                    // COMMAND_EXPIRED is handled by performOrderedRouted() with
+                    // a fresh-ID/same-sequence retry. Do not flash the old error
+                    // into the UI while that newest intent is actively
+                    // recovering. A non-retryable rejection is still surfaced
+                    // immediately, and exhausted retries are surfaced by the
+                    // caller's normal error path.
+                    if !shouldRetryOrderedDelivery(message: message) {
+                        errorMessage = message
+                    }
                 }
             }
             return

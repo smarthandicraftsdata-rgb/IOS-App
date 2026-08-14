@@ -183,7 +183,7 @@ final class CloudRealtimeClient: NSObject, URLSessionWebSocketDelegate {
         candidateIndex += 1
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("SHLAMP-iOS/1.8.2-RF5.4.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.3-RF5.4.3", forHTTPHeaderField: "User-Agent")
         Task { @MainActor in delegate?.realtimeClient(self, didChangeStatus: "Connecting live cloud…", connected: false) }
         let newTask = session.webSocketTask(with: request)
         task = newTask
