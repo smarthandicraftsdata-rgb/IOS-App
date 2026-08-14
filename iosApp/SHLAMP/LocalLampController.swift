@@ -422,7 +422,7 @@ final class LocalLampController: NSObject {
         request.timeoutInterval = 1.0
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.8.1-RF5.4.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.2-RF5.4.2", forHTTPHeaderField: "User-Agent")
         request.httpBody = try jsonData(orderedObject(intent))
         let (data, response) = try await controlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -668,13 +668,19 @@ final class LocalLampController: NSObject {
         _ = try await request(host: host, path: "/api/brightness?value=\(value)")
     }
 
-    func sendPowerMode(host: String, mode: LampPowerMode) async throws -> WiFiLampSnapshot? {
+    func sendPowerMode(host: String, expectedLampID: String, mode: LampPowerMode) async throws -> WiFiLampSnapshot? {
+        // RF5.4.2: power-mode can disable Wi-Fi, so identity must be proven
+        // BEFORE mutation. Never mutate a remembered DHCP address first and
+        // discover afterward that it now belongs to another physical lamp.
+        _ = try await verifyPhysicalIdentity(host: host, expectedLampID: expectedLampID)
         let path = "/api/power-mode?mode=\(mode.firmwareValue)"
         if mode == .bleOnly || mode == .touchOnly {
             _ = try await request(host: host, path: path)
             return nil
         }
-        return try await verified(host: host, path: path) { $0.powerMode == mode }
+        return try await verified(host: host, path: path) { snapshot in
+            snapshot.lampId.caseInsensitiveCompare(expectedLampID) == .orderedSame && snapshot.powerMode == mode
+        }
     }
 
     func sendFade(host: String, mode: Int) async throws -> WiFiLampSnapshot {
@@ -689,16 +695,20 @@ final class LocalLampController: NSObject {
         }
     }
 
-    func identify(host: String) async throws {
+    func identify(host: String, expectedLampID: String) async throws {
+        _ = try await verifyPhysicalIdentity(host: host, expectedLampID: expectedLampID)
         _ = try await request(host: host, path: "/api/identify")
     }
 
-    func rename(host: String, name: String) async throws -> WiFiLampSnapshot {
+    func rename(host: String, expectedLampID: String, name: String) async throws -> WiFiLampSnapshot {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let encoded = clean.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
             throw AppError.message("Invalid lamp name.")
         }
-        return try await verified(host: host, path: "/api/name?value=\(encoded)") { $0.lampName == clean }
+        _ = try await verifyPhysicalIdentity(host: host, expectedLampID: expectedLampID)
+        return try await verified(host: host, path: "/api/name?value=\(encoded)") { snapshot in
+            snapshot.lampId.caseInsensitiveCompare(expectedLampID) == .orderedSame && snapshot.lampName == clean
+        }
     }
 
     func readControllers(host: String) async throws -> [LampControllerAccess] {
@@ -710,6 +720,19 @@ final class LocalLampController: NSObject {
             guard !id.isEmpty else { return nil }
             return LampControllerAccess(controllerId: id, label: firstNonBlank(object.string("label"), "Controller"), owner: object.string("role") == "OWNER")
         }
+    }
+
+    private func verifyPhysicalIdentity(host: String, expectedLampID: String) async throws -> WiFiLampSnapshot {
+        let expected = expectedLampID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !expected.isEmpty else {
+            throw AppError.message("The physical lamp identity is unavailable for this local command.")
+        }
+        let snapshot = try await readStatus(host: host)
+        let actual = snapshot.lampId.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard actual == expected else {
+            throw AppError.message("The remembered local address now belongs to a different lamp.")
+        }
+        return snapshot
     }
 
     private func verified(host: String, path: String, verify: (WiFiLampSnapshot) -> Bool) async throws -> WiFiLampSnapshot {
@@ -729,7 +752,7 @@ final class LocalLampController: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.15
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.8.1-RF5.4.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.2-RF5.4.2", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await controlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? ""

@@ -178,6 +178,9 @@ struct LampState: Codable, Equatable {
 }
 
 struct LampRecord: Identifiable, Codable, Equatable {
+    /// RF5.4.2: physical identity exposed by ESP /api/status.lampId and BLE.
+    /// This must never be replaced by the Render/account ID when records merge.
+    var physicalLocalID: String?
     var id: String
     var cloudLampId: String?
     var cloudClaimed = false
@@ -201,13 +204,14 @@ struct LampRecord: Identifiable, Codable, Equatable {
     var state: LampState
 
     private enum CodingKeys: String, CodingKey {
-        case id, cloudLampId, cloudClaimed, homeId, roomId, roomName, name, model
+        case physicalLocalID, id, cloudLampId, cloudClaimed, homeId, roomId, roomName, name, model
         case firmware, online, lastSeen, route, routePreference, bleIdentifier, bleName
         case localHost, wifiSSID, wifiRSSI, bleRSSI, controllerCount, state
     }
 
     init(
         id: String,
+        physicalLocalID: String? = nil,
         cloudLampId: String? = nil,
         cloudClaimed: Bool = false,
         homeId: String,
@@ -229,6 +233,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
         controllerCount: Int,
         state: LampState
     ) {
+        self.physicalLocalID = physicalLocalID
         self.id = id
         self.cloudLampId = cloudLampId
         self.cloudClaimed = cloudClaimed
@@ -254,6 +259,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        physicalLocalID = try values.decodeIfPresent(String.self, forKey: .physicalLocalID)
         id = try values.decode(String.self, forKey: .id)
         cloudLampId = try values.decodeIfPresent(String.self, forKey: .cloudLampId)
         cloudClaimed = try values.decodeIfPresent(Bool.self, forKey: .cloudClaimed) ?? false
@@ -277,15 +283,50 @@ struct LampRecord: Identifiable, Codable, Equatable {
         state = try values.decodeIfPresent(LampState.self, forKey: .state) ?? LampState()
     }
 
+    /// Stable app/UI identity. A linked Cloud ID remains canonical for account views,
+    /// while transport-specific code must use physicalLocalIDNormalized/cloudIDNormalized.
     var canonicalID: String {
         (cloudLampId?.isEmpty == false ? cloudLampId! : id).uppercased()
+    }
+
+    var physicalLocalIDNormalized: String? {
+        if let value = physicalLocalID?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+            return value.uppercased()
+        }
+        // Backward compatibility for persisted RF5.4.1 local records. A local-only
+        // record's `id` was the physical ID. Never apply this fallback to a merged
+        // Cloud record because its `id` can be the Render ID.
+        if cloudLampId == nil {
+            let value = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value.uppercased()
+        }
+        return nil
+    }
+
+    var cloudIDNormalized: String? {
+        if let value = cloudLampId?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+            return value.uppercased()
+        }
+        // Dashboard/cloud-only records are normalized with cloudLampId in
+        // AppViewModel.rebuildLamps/applyCloudLamp before routing.
+        return nil
+    }
+
+    /// RF5.4.2 migration for records loaded from the local-device store.
+    /// RF5.4.1 stored the physical ESP ID in `id` even after cloudLampId was linked.
+    /// Dashboard/cloud records must never call this helper.
+    mutating func normalizePersistedLocalIdentity() {
+        let explicit = physicalLocalID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let physical = (explicit?.isEmpty == false ? explicit! : id).uppercased()
+        physicalLocalID = physical
+        id = physical
     }
 
     var reachable: Bool { route != .offline || online }
 
     static func placeholder(id: String, name: String = "SH Lamp") -> LampRecord {
         LampRecord(
-            id: id.uppercased(), cloudLampId: nil, homeId: "default", roomId: nil,
+            id: id.uppercased(), physicalLocalID: id.uppercased(), cloudLampId: nil, homeId: "default", roomId: nil,
             roomName: nil, name: name, model: "", firmware: nil, online: false,
             lastSeen: nil, route: .offline, bleIdentifier: nil, bleName: nil,
             localHost: nil, wifiSSID: nil, wifiRSSI: -127, bleRSSI: -127,

@@ -318,7 +318,7 @@ final class CloudAPI {
         request.timeoutInterval = controlPath ? 1.15 : 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.setValue("SHLAMP-iOS/1.8.1-RF5.4.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.2-RF5.4.2", forHTTPHeaderField: "User-Agent")
         if let token, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body { request.httpBody = try jsonData(body) }
         let activeSession = controlPath ? controlSession : session

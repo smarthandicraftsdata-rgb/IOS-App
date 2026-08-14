@@ -390,7 +390,7 @@ final class AppViewModel: ObservableObject {
         local.startDiscovery()
         for record in localRecords.values {
             guard let host = record.localHost else { continue }
-            local.startRealtime(host: host, expectedLampID: record.id)
+            local.startRealtime(host: host, expectedLampID: record.physicalLocalIDNormalized)
         }
         if !manualAddFlowActive { ble.startScan() }
         if let token = session?.accessToken {
@@ -540,7 +540,8 @@ final class AppViewModel: ObservableObject {
         return lamps.first { candidate in
             candidate.canonicalID.uppercased() == canonical ||
             candidate.id.uppercased() == lamp.id.uppercased() ||
-            (lamp.cloudLampId != nil && candidate.cloudLampId?.uppercased() == lamp.cloudLampId?.uppercased())
+            (lamp.physicalLocalIDNormalized != nil && candidate.physicalLocalIDNormalized == lamp.physicalLocalIDNormalized) ||
+            (lamp.cloudIDNormalized != nil && candidate.cloudIDNormalized == lamp.cloudIDNormalized)
         } ?? lamp
     }
 
@@ -549,10 +550,12 @@ final class AppViewModel: ObservableObject {
         let keys = [
             lamp.canonicalID.uppercased(),
             lamp.id.uppercased(),
-            lamp.cloudLampId?.uppercased(),
+            lamp.physicalLocalIDNormalized,
+            lamp.cloudIDNormalized,
             fresh.canonicalID.uppercased(),
             fresh.id.uppercased(),
-            fresh.cloudLampId?.uppercased()
+            fresh.physicalLocalIDNormalized,
+            fresh.cloudIDNormalized
         ].compactMap { $0 }
         if let cached = keys.compactMap({ rememberedBrightnessByLamp[$0] }).first {
             return max(1, min(100, cached))
@@ -705,9 +708,10 @@ final class AppViewModel: ObservableObject {
             guard isCurrentControlIntent(generation, for: lamp, field: "output") else { return nil }
             switch route {
             case .wifi:
-                guard isWiFiHealthy(lamp), let host = lamp.localHost else { continue }
+                guard isWiFiHealthy(lamp), let host = lamp.localHost,
+                      let expectedPhysicalID = lamp.physicalLocalIDNormalized else { continue }
                 do {
-                    _ = try await local.sendOrderedCommand(host: host, expectedLampID: lamp.id, intent: intent, waitForAck: false)
+                    _ = try await local.sendOrderedCommand(host: host, expectedLampID: expectedPhysicalID, intent: intent, waitForAck: false)
                     return .wifi
                 } catch {
                     markWiFiFailure(for: lamp)
@@ -754,11 +758,15 @@ final class AppViewModel: ObservableObject {
                 try await performRouted(
                     lamp: lamp,
                     localAction: { host in
-                        if let snapshot = try await self.local.sendPowerMode(host: host, mode: mode) {
+                        guard let expectedPhysicalID = lamp.physicalLocalIDNormalized else {
+                            throw AppError.message("The physical lamp identity is unavailable for local Wi-Fi control.")
+                        }
+                        if let snapshot = try await self.local.sendPowerMode(host: host, expectedLampID: expectedPhysicalID, mode: mode) {
                             return snapshot
                         }
-                        var fallback = self.localSnapshots[lamp.id.uppercased()] ?? WiFiLampSnapshot(
-                            lampId: lamp.id, cloudLampId: lamp.cloudLampId, lampName: lamp.name,
+                        let physicalID = expectedPhysicalID
+                        var fallback = self.localSnapshots[physicalID] ?? WiFiLampSnapshot(
+                            lampId: physicalID, cloudLampId: lamp.cloudIDNormalized, lampName: lamp.name,
                             hostname: "", firmware: lamp.firmware ?? "", power: lamp.state.power,
                             currentBrightness: lamp.state.brightness, targetBrightness: lamp.state.brightness,
                             lastBrightness: lamp.state.rememberedBrightness, fadeMode: lamp.state.fadeMode,
@@ -869,7 +877,10 @@ final class AppViewModel: ObservableObject {
                 try await performRouted(
                     lamp: lamp,
                     localAction: { host in
-                        try await self.local.identify(host: host)
+                        guard let expectedPhysicalID = lamp.physicalLocalIDNormalized else {
+                            throw AppError.message("The physical lamp identity is unavailable for local identification.")
+                        }
+                        try await self.local.identify(host: host, expectedLampID: expectedPhysicalID)
                         return try await self.local.readStatus(host: host)
                     },
                     bleAction: { self.ble.identify() },
@@ -888,8 +899,10 @@ final class AppViewModel: ObservableObject {
         defer { busy = false }
         do {
             if canUseBLE(lamp) { ble.renameLamp(name) }
-            if let host = lamp.localHost { _ = try? await local.rename(host: host, name: name) }
-            if let remoteID = lamp.cloudLampId ?? (lamp.id.hasPrefix("SH-") ? lamp.id : nil) {
+            if let host = lamp.localHost, let expectedPhysicalID = lamp.physicalLocalIDNormalized {
+                _ = try? await local.rename(host: host, expectedLampID: expectedPhysicalID, name: name)
+            }
+            if let remoteID = lamp.cloudIDNormalized {
                 let updated = try await withAccessToken { token in
                     try await api.updateDevice(accessToken: token, lampId: remoteID, displayName: name, roomId: roomID, updateRoom: true)
                 }
@@ -903,7 +916,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func releaseLamp(_ lamp: LampRecord) async -> ReleasedLamp? {
-        guard let remoteID = lamp.cloudLampId ?? (lamp.id.hasPrefix("SH-") ? lamp.id : nil) else { return nil }
+        guard let remoteID = lamp.cloudIDNormalized else { return nil }
         busy = true
         defer { busy = false }
         do {
@@ -938,19 +951,12 @@ final class AppViewModel: ObservableObject {
     }
 
     private func remoteID(for lamp: LampRecord) throws -> String {
-        if lamp.cloudClaimed,
-           let cloud = lamp.cloudLampId?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !cloud.isEmpty,
-           dashboard.lamps.contains(where: { $0.id.caseInsensitiveCompare(cloud) == .orderedSame }) {
-            return cloud.uppercased()
-        }
-        let direct = lamp.id.uppercased()
-        guard direct.hasPrefix("SH-") && dashboard.lamps.contains(where: {
-            $0.id.caseInsensitiveCompare(direct) == .orderedSame
-        }) else {
+        guard lamp.cloudClaimed,
+              let cloud = lamp.cloudIDNormalized,
+              dashboard.lamps.contains(where: { $0.id.caseInsensitiveCompare(cloud) == .orderedSame }) else {
             throw AppError.message("Move closer to the lamp or enable remote access.")
         }
-        return direct
+        return cloud
     }
 
     private func performRouted(
@@ -1033,7 +1039,7 @@ final class AppViewModel: ObservableObject {
             throw AppError.message("No available connection could control this lamp.")
         }
         let commandStartedAt = Date()
-        print("RF5.4.1 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
+        print("RF5.4.2 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
 
         // RF5.4 route hedging: do not wait for one transport's multi-second
         // timeout before trying another already-known healthy path. The same
@@ -1081,7 +1087,7 @@ final class AppViewModel: ObservableObject {
         guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
         switch outcome {
         case .success(let route):
-            print("RF5.4.1 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
+            print("RF5.4.2 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
             updateLocalRecord(for: lamp) { record in
                 record.route = route
                 record.online = true
@@ -1100,15 +1106,18 @@ final class AppViewModel: ObservableObject {
     ) async throws -> LampConnectionRoute {
         let target = freshestLampRecord(for: lamp)
         let startedAt = Date()
-        print("RF5.4.1 CMD app_send id=\(intent.commandID) route=\(route.rawValue) action=\(intent.action)")
+        print("RF5.4.2 CMD app_send id=\(intent.commandID) route=\(route.rawValue) action=\(intent.action)")
         do {
             switch route {
             case .wifi:
                 guard isWiFiHealthy(target), let host = target.localHost else {
                     throw AppError.message("Local Wi-Fi is not currently reachable.")
                 }
+                guard let expectedPhysicalID = target.physicalLocalIDNormalized else {
+                    throw AppError.message("The physical lamp identity is not available for Local Wi-Fi control.")
+                }
                 let requestStartedAt = Date()
-                if let snapshot = try await local.sendOrderedCommand(host: host, expectedLampID: target.id, intent: intent, waitForAck: true) {
+                if let snapshot = try await local.sendOrderedCommand(host: host, expectedLampID: expectedPhysicalID, intent: intent, waitForAck: true) {
                     apply(snapshot: snapshot, observedAt: requestStartedAt, authoritative: true)
                 }
             case .bluetooth:
@@ -1126,10 +1135,10 @@ final class AppViewModel: ObservableObject {
                 throw AppError.message("Offline is not a control route.")
             }
             noteRouteSuccess(route, lamp: target, startedAt: startedAt)
-            print("RF5.4.1 CMD app_ack id=\(intent.commandID) route=\(route.rawValue) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+            print("RF5.4.2 CMD app_ack id=\(intent.commandID) route=\(route.rawValue) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
             return route
         } catch {
-            print("RF5.4.1 CMD app_fail id=\(intent.commandID) route=\(route.rawValue) after=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms error=\(error.localizedDescription)")
+            print("RF5.4.2 CMD app_fail id=\(intent.commandID) route=\(route.rawValue) after=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms error=\(error.localizedDescription)")
             noteRouteFailure(route, lamp: target)
             if route == .wifi { markWiFiFailure(for: target) }
             throw error
@@ -1216,10 +1225,9 @@ final class AppViewModel: ObservableObject {
         // usable in that window instead of incorrectly declaring the lamp
         // Offline and refusing to send the REST fallback.
         guard session != nil else { return false }
-        let candidateIDs = [lamp.cloudLampId?.uppercased(), lamp.id.uppercased()].compactMap { $0 }
-        guard !candidateIDs.isEmpty else { return false }
+        guard let cloudID = lamp.cloudIDNormalized else { return false }
         return dashboard.lamps.contains { cloudLamp in
-            candidateIDs.contains(cloudLamp.id.uppercased()) && cloudLamp.online
+            cloudLamp.id.caseInsensitiveCompare(cloudID) == .orderedSame && cloudLamp.online
         }
     }
 
@@ -1249,7 +1257,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func updateLocalRecord(for lamp: LampRecord, change: (inout LampRecord) -> Void) {
-        let keys = [lamp.id.uppercased(), lamp.cloudLampId?.uppercased()].compactMap { $0 }
+        let keys = [lamp.id.uppercased(), lamp.physicalLocalIDNormalized, lamp.cloudIDNormalized].compactMap { $0 }
         let existingKey = localRecords.keys.first { key in
             keys.contains(key) || localRecords[key]?.cloudLampId.map { keys.contains($0.uppercased()) } == true
         }
@@ -1296,7 +1304,7 @@ final class AppViewModel: ObservableObject {
                             // transport. A validated realtime state therefore
                             // proves the current Wi-Fi path by itself; an extra
                             // HTTP status probe is no longer required.
-                            if self.local.isRealtimeHealthy(host: host, expectedLampID: record.id) { continue }
+                            if self.local.isRealtimeHealthy(host: host, expectedLampID: record.physicalLocalIDNormalized) { continue }
                             guard !self.localPollInFlight.contains(key) else { continue }
                             self.localPollInFlight.insert(key)
                             Task { @MainActor [weak self] in
@@ -1324,7 +1332,7 @@ final class AppViewModel: ObservableObject {
         // A live protocol-v3 socket is stronger evidence than a single HTTP
         // timeout. Do not let a transient HTTP miss tear down a working LAN
         // route or erase the remembered host.
-        if let host = lamp.localHost, local.isRealtimeHealthy(host: host, expectedLampID: lamp.id) {
+        if let host = lamp.localHost, local.isRealtimeHealthy(host: host, expectedLampID: lamp.physicalLocalIDNormalized) {
             localFailureCounts[key] = 0
             rebuildLamps()
             return
@@ -1388,7 +1396,7 @@ final class AppViewModel: ObservableObject {
         if wifiPathAvailable {
             for record in localCandidates.prefix(2) {
                 guard let host = record.localHost, !isWiFiHealthy(record, now: now) else { continue }
-                local.recoverRealtime(host: host, expectedLampID: record.id)
+                local.recoverRealtime(host: host, expectedLampID: record.physicalLocalIDNormalized)
             }
 
             if localCandidates.contains(where: { !isWiFiHealthy($0, now: now) }),
@@ -1430,7 +1438,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
-        guard wifiPathAvailable, let host = lamp.localHost else { return false }
+        guard wifiPathAvailable, let host = lamp.localHost, lamp.physicalLocalIDNormalized != nil else { return false }
         let keys = stateKeys(for: lamp)
         // RF5.4: there is deliberately NO Cloud→LAN time fence. Every ordered
         // route carries the same controller/session/sequence identity, so an
@@ -1445,7 +1453,7 @@ final class AppViewModel: ObservableObject {
         // Requiring a separate HTTP success here was the reason the video could
         // show Offline even while the ESP logged a connected local realtime
         // client.
-        if local.isRealtimeHealthy(host: host, expectedLampID: lamp.id, now: now) { return true }
+        if local.isRealtimeHealthy(host: host, expectedLampID: lamp.physicalLocalIDNormalized, now: now) { return true }
 
         // If realtime is unavailable, retain the bounded HTTP liveness fallback.
         guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else { return false }
@@ -1621,7 +1629,7 @@ final class AppViewModel: ObservableObject {
         if ack.bool("success") == false {
             throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
         }
-        print("RF5.4.1 CMD cloud_ws_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+        print("RF5.4.2 CMD cloud_ws_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
     }
 
     private func sendCloudRESTOrderedCommand(lampID: String, intent: OrderedControlIntent) async throws {
@@ -1639,7 +1647,7 @@ final class AppViewModel: ObservableObject {
         if ack.bool("success") == false {
             throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
         }
-        print("RF5.4.1 CMD cloud_rest_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+        print("RF5.4.2 CMD cloud_rest_ack id=\(intent.commandID) rtt=\(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
     }
 
     private func sendCloudCommand(lampID: String, action: String, value: Any) async throws {
@@ -1750,7 +1758,7 @@ final class AppViewModel: ObservableObject {
                     let remembered = Array(self.localRecords.values.filter { $0.localHost != nil })
                     for record in remembered {
                         guard let host = record.localHost else { continue }
-                        self.local.startRealtime(host: host, expectedLampID: record.id)
+                        self.local.startRealtime(host: host, expectedLampID: record.physicalLocalIDNormalized)
                         let key = record.id.uppercased()
                         guard !self.localPollInFlight.contains(key) else { continue }
                         self.localPollInFlight.insert(key)
@@ -1802,6 +1810,9 @@ final class AppViewModel: ObservableObject {
               let records = try? JSONDecoder().decode([LampRecord].self, from: data) else { return }
         localRecords = Dictionary(uniqueKeysWithValues: records.map { record in
             var restored = record
+            // RF5.4.2 migration: RF5.4.1 persisted local records used `id` as
+            // the physical ESP/BLE identity even when cloudLampId was linked.
+            restored.normalizePersistedLocalIdentity()
             restored.route = .offline
             restored.online = false
             // Ordering tokens are live-session evidence, not user preferences.
@@ -1814,7 +1825,7 @@ final class AppViewModel: ObservableObject {
             // the signed-in user's cloud dashboard. Keep the reported cloud ID,
             // but never trust a persisted Boolean from another account/session.
             restored.cloudClaimed = false
-            return (restored.id.uppercased(), restored)
+            return (restored.physicalLocalIDNormalized ?? restored.id.uppercased(), restored)
         })
     }
 
@@ -1842,9 +1853,9 @@ final class AppViewModel: ObservableObject {
         let nearbyID = nearby.lampId.uppercased()
         return lamps.first { lamp in
             lamp.bleIdentifier == nearby.id ||
-                lamp.id.uppercased() == nearbyID ||
-                lamp.cloudLampId?.uppercased() == nearbyID ||
-                (nearbyID.hasPrefix("SH-") && nearbyID.count == 9 && lamp.canonicalID.hasSuffix(String(nearbyID.dropFirst(3))))
+                lamp.physicalLocalIDNormalized == nearbyID ||
+                (nearbyID.hasPrefix("SH-") && nearbyID.count == 9 &&
+                    lamp.physicalLocalIDNormalized?.hasSuffix(String(nearbyID.dropFirst(3))) == true)
         }
     }
 
@@ -1892,13 +1903,15 @@ final class AppViewModel: ObservableObject {
 
     private func canUseBLE(_ lamp: LampRecord) -> Bool {
         guard ble.isBluetoothPoweredOn, ble.isReady else { return false }
-        let candidates = [lamp.id.uppercased(), lamp.cloudLampId?.uppercased()].compactMap { $0 }
-        return candidates.contains(connectedLocalID.uppercased()) || lamp.bleIdentifier == ble.connectedPeripheralID
+        let connectedPhysical = connectedLocalID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if let expectedPhysical = lamp.physicalLocalIDNormalized, expectedPhysical == connectedPhysical { return true }
+        return lamp.bleIdentifier != nil && lamp.bleIdentifier == ble.connectedPeripheralID && lamp.physicalLocalIDNormalized != nil
     }
 
     private func stateKeys(for lamp: LampRecord) -> [String] {
         var keys = [lamp.id.uppercased(), lamp.canonicalID.uppercased()]
-        if let cloudID = lamp.cloudLampId?.uppercased() { keys.append(cloudID) }
+        if let physicalID = lamp.physicalLocalIDNormalized { keys.append(physicalID) }
+        if let cloudID = lamp.cloudIDNormalized { keys.append(cloudID) }
         var seen: Set<String> = []
         return keys.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
@@ -2035,6 +2048,7 @@ final class AppViewModel: ObservableObject {
         var record = localRecords[key] ?? .placeholder(id: localID, name: snapshot.lampName)
         let previous = record
         record.id = localID
+        record.physicalLocalID = localID
         record.cloudLampId = cloudID ?? record.cloudLampId
         if let cloudID, dashboard.lamps.contains(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame }) {
             record.cloudClaimed = true
@@ -2107,8 +2121,9 @@ final class AppViewModel: ObservableObject {
     private func rebuildLamps() {
         var normalizedLocal: [String: LampRecord] = [:]
         for var localRecord in localRecords.values {
-            let localKey = localRecord.id.uppercased()
+            let localKey = (localRecord.physicalLocalIDNormalized ?? localRecord.id.uppercased())
             localRecord.id = localKey
+            localRecord.physicalLocalID = localKey
             localRecord.cloudClaimed = localRecord.cloudLampId.map { cloudID in
                 dashboard.lamps.contains { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame }
             } ?? false
@@ -2125,6 +2140,7 @@ final class AppViewModel: ObservableObject {
         for var cloud in dashboard.lamps {
             let cloudID = cloud.id.uppercased()
             cloud.id = cloudID
+            cloud.physicalLocalID = nil
             cloud.cloudLampId = cloudID
             cloud.cloudClaimed = true
             cloud.route = cloud.online ? .cloud : .offline
@@ -2156,6 +2172,7 @@ final class AppViewModel: ObservableObject {
 
     private func mergeRecords(_ primary: LampRecord, _ local: LampRecord) -> LampRecord {
         var merged = primary
+        merged.physicalLocalID = local.physicalLocalIDNormalized ?? local.id.uppercased()
         merged.cloudLampId = local.cloudLampId ?? merged.cloudLampId
         merged.cloudClaimed = merged.cloudClaimed || local.cloudClaimed
         merged.name = local.name == "SH Lamp" && merged.name != "SH Lamp" ? merged.name : local.name
@@ -2170,7 +2187,7 @@ final class AppViewModel: ObservableObject {
         merged.bleRSSI = local.bleRSSI != -127 ? local.bleRSSI : merged.bleRSSI
         merged.firmware = local.firmware ?? merged.firmware
         merged.controllerCount = max(local.controllerCount, merged.controllerCount)
-        let localKeys = [local.id.uppercased(), local.cloudLampId?.uppercased()].compactMap { $0 }
+        let localKeys = [local.physicalLocalIDNormalized, local.id.uppercased(), local.cloudIDNormalized].compactMap { $0 }
         let cloudKeys = [primary.id.uppercased(), primary.cloudLampId?.uppercased()].compactMap { $0 }
         let localFullStateAt = localKeys.compactMap { key in
             [localStateReceivedAt[key], bleStateReceivedAt[key]].compactMap { $0 }.max()
@@ -2275,6 +2292,7 @@ final class AppViewModel: ObservableObject {
         var lamp = incoming
         let id = lamp.id.uppercased()
         lamp.id = id
+        lamp.physicalLocalID = nil
         lamp.cloudLampId = id
         lamp.cloudClaimed = true
         lamp.route = lamp.online ? .cloud : .offline
@@ -2422,6 +2440,7 @@ extension AppViewModel: BLELampManagerDelegate {
         guard manualAddFlowActive || identityProbeMatched || existing != nil else { return }
         var record = existing ?? cloudMatch ?? .placeholder(id: localKey)
         record.id = localKey
+        record.physicalLocalID = localKey
         record.cloudLampId = normalizedCloudID ?? record.cloudLampId
         if cloudMatch != nil { record.cloudClaimed = true }
         if manualAddFlowActive && existing == nil && cloudMatch == nil {
@@ -2454,6 +2473,7 @@ extension AppViewModel: BLELampManagerDelegate {
             ?? linkedCloud.flatMap { cloudID in dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame }) }
             ?? .placeholder(id: localKey)
         record.id = localKey
+        record.physicalLocalID = localKey
         record.bleIdentifier = peripheralID
         record.bleName = name
         record.bleRSSI = nearbyLamps.first(where: { $0.id == peripheralID })?.rssi ?? record.bleRSSI
