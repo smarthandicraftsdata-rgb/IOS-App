@@ -31,9 +31,9 @@ require(IOS / "LocalLampController.swift", [
     "Task.sleep(for: .milliseconds(750))", "request.timeoutInterval = 1.0", "realtimeExpectedLampByHost",
 ])
 require(IOS / "AppViewModel.swift", [
-    "base = [.bluetooth, .wifi, .cloud]", "routeHedgeDelayMs = 180",
-    "withTaskGroup(of: OrderedRouteAttemptOutcome.self", "same-ID cloud hedge",
-    "Task.sleep(for: .milliseconds(220))", "timeout: 0.75", "timeout: 1.6",
+    "base = [.bluetooth, .wifi, .cloud]", "routeHedgeDelayMs = 120",
+    "withTaskGroup(", "Cloud NEVER runs in parallel with a usable local route",
+    "do not fire WS and REST for the same Cloud command in", "timeout: 0.60", "timeout: 1.6",
     "there is deliberately NO Cloud→LAN time fence", "consecutiveFailures >= 2",
     "physicalLocalIDNormalized", "cloudIDNormalized", "setOutputState",
 ])
@@ -54,8 +54,8 @@ with (IOS / "Info.plist").open("rb") as handle: plist = plistlib.load(handle)
 if plist.get("CFBundleShortVersionString") != "$(MARKETING_VERSION)": errors.append("Info.plist marketing version is not inherited from Xcode")
 if plist.get("CFBundleVersion") != "$(CURRENT_PROJECT_VERSION)": errors.append("Info.plist build number is not inherited from Xcode")
 pbx = (ROOT / "iosApp/SHLAMP.xcodeproj/project.pbxproj").read_text()
-if pbx.count("MARKETING_VERSION = 1.8.4") != 2: errors.append("Expected Debug and Release MARKETING_VERSION 1.8.4")
-if pbx.count("CURRENT_PROJECT_VERSION = 26") != 2: errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 26")
+if pbx.count("MARKETING_VERSION = 1.8.5") != 2: errors.append("Expected Debug and Release MARKETING_VERSION 1.8.5")
+if pbx.count("CURRENT_PROJECT_VERSION = 27") != 2: errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 27")
 
 expected_hashes = json.loads((ROOT / "docs/RF5.4.3_SOURCE_SHA256.json").read_text())
 for name, expected in expected_hashes.items():
@@ -69,7 +69,7 @@ if errors:
 print("RELEASE AUDIT PASSED")
 print("- Legacy BLE/local API compatibility: passed")
 print("- RF5.4.2 physical/cloud identity separation: passed")
-print("- RF5.4.2 BLE/LAN/Cloud route hedging: passed")
+print("- RF5.4.3 R3.3 local-only BLE/LAN hedging + Cloud fallback: passed")
 print("- RF5.4.2 bounded LAN/Cloud control timeouts: passed")
 print("- Version consistency: passed")
 print("- Core source hash integrity: passed")

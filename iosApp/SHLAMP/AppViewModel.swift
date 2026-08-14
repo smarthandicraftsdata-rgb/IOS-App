@@ -248,15 +248,15 @@ final class AppViewModel: ObservableObject {
     private var pendingCloudMutationCommands: [String: String] = [:]
     private var latestCloudMutationCommandByLampID: [String: String] = [:]
     private var routeHealth: [String: RouteHealthState] = [:]
-    private let routeHedgeDelayMs = 180
+    private let routeHedgeDelayMs = 120 // R3.3: hedge only BLE<->LAN; Cloud is a fallback, never a parallel local-route competitor
     // RF5.4.3: only the latest logical intent is allowed to recover. Each
     // recovery attempt keeps the same ordered sequence/value but uses a fresh
     // command ID, so a timed-out/expired Render row cannot permanently strand
     // a final OFF or slider-release value. A newer user intent increments the
     // field generation and immediately cancels these retries.
-    private let durableDeliveryRetryDelaysMs = [0, 140, 320]
+    private let durableDeliveryRetryDelaysMs = [0, 450, 1_100] // R3.3: give ESP/Render time to drain before final-intent transport retries
 
-    private let wifiHealthTTL: TimeInterval = 7
+    private let wifiHealthTTL: TimeInterval = 30 // R3.3: validated LAN lease survives brief Local-WS/cloud handover churn
     private let wifiTransitionGrace: TimeInterval = 12
     private let localPollInterval: Duration = .seconds(2)
     private let connectionRecoveryInterval: Duration = .seconds(2)
@@ -1177,77 +1177,97 @@ final class AppViewModel: ObservableObject {
         guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
         let currentLamp = freshestLampRecord(for: lamp)
         let orderedRoutes = routeOrder(for: currentLamp).filter { $0 != .offline }
-        // Already-usable routes go first so Cloud is not artificially delayed
-        // when BLE/LAN are absent. Routes that are currently unavailable still
-        // get a later hedge slot: if LAN comes up while a Cloud command is
-        // pending, that SAME logical command can move to LAN without waiting for
-        // the Cloud timeout. An unavailable route is skipped, not counted as a
-        // semantic failure.
-        let available = orderedRoutes.filter { routeCanBeAttempted($0, lamp: currentLamp) }
-        let unavailable = orderedRoutes.filter { !routeCanBeAttempted($0, lamp: currentLamp) }
-        let candidates = available + unavailable
-        guard !candidates.isEmpty else {
+        guard !orderedRoutes.isEmpty else {
             throw AppError.message("No available connection could control this lamp.")
         }
+
         let commandStartedAt = Date()
-        print("RF5.4.3 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
+        print("RF5.4.3-R3.3 CMD app_create id=\(intent.commandID) seq=\(intent.intentSequence) action=\(intent.action) lamp=\(lamp.canonicalID)")
 
-        // RF5.4 route hedging: do not wait for one transport's multi-second
-        // timeout before trying another already-known healthy path. The same
-        // command ID + controller/session/sequence is sent on every hedge, so
-        // ESP-side idempotency/order protection guarantees at-most-once
-        // physical execution even if two routes deliver it.
-        let outcome = await withTaskGroup(of: OrderedRouteAttemptOutcome.self, returning: OrderedRouteAttemptOutcome.self) { group in
-            for (index, route) in candidates.enumerated() {
-                let delayMs = index * routeHedgeDelayMs
-                group.addTask { [weak self] in
-                    guard let self else { return .skipped }
-                    if delayMs > 0 {
-                        try? await Task.sleep(for: .milliseconds(delayMs))
-                    }
-                    guard !Task.isCancelled else { return .skipped }
-                    let stillCurrent = await self.isCurrentControlIntent(generation, for: lamp, field: field)
-                    guard stillCurrent else { return .skipped }
-                    let liveLamp = await self.freshestLampRecord(for: lamp)
-                    let canAttempt = await self.routeCanBeAttempted(route, lamp: liveLamp)
-                    guard canAttempt else { return .skipped }
-                    do {
-                        let successfulRoute = try await self.attemptOrderedRoute(route, lamp: lamp, intent: intent)
-                        return .success(successfulRoute)
-                    } catch {
-                        return .failure(error.localizedDescription)
+        // R3.3 physical architecture:
+        // 1) BLE and LAN may hedge each other using the SAME logical command.
+        // 2) Cloud NEVER runs in parallel with a usable local route.
+        // This prevents a Cloud fault/backpressure episode from dragging a
+        // healthy same-network lamp into Offline or doubling device ingress.
+        let localPriority = orderedRoutes.filter { $0 == .bluetooth || $0 == .wifi }
+        let initiallyUsableLocal = localPriority.filter { routeCanBeAttempted($0, lamp: currentLamp) }
+
+        var lastFailure = "No available connection could control this lamp."
+
+        if !initiallyUsableLocal.isEmpty {
+            let localOutcome = await withTaskGroup(
+                of: OrderedRouteAttemptOutcome.self,
+                returning: OrderedRouteAttemptOutcome.self
+            ) { group in
+                for (index, route) in initiallyUsableLocal.enumerated() {
+                    let delayMs = index * routeHedgeDelayMs
+                    group.addTask { [weak self] in
+                        guard let self else { return .skipped }
+                        if delayMs > 0 { try? await Task.sleep(for: .milliseconds(delayMs)) }
+                        guard !Task.isCancelled else { return .skipped }
+                        let stillCurrent = await self.isCurrentControlIntent(generation, for: lamp, field: field)
+                        guard stillCurrent else { return .skipped }
+                        let liveLamp = await self.freshestLampRecord(for: lamp)
+                        guard await self.routeCanBeAttempted(route, lamp: liveLamp) else { return .skipped }
+                        do {
+                            return .success(try await self.attemptOrderedRoute(route, lamp: lamp, intent: intent))
+                        } catch {
+                            return .failure(error.localizedDescription)
+                        }
                     }
                 }
+
+                var localFailure = "No local route acknowledged the command."
+                while let result = await group.next() {
+                    switch result {
+                    case .success:
+                        group.cancelAll()
+                        return result
+                    case .failure(let message):
+                        if !message.isEmpty { localFailure = message }
+                    case .skipped:
+                        break
+                    }
+                }
+                return .failure(localFailure)
             }
 
-            var lastFailure = "No available connection could control this lamp."
-            while let result = await group.next() {
-                switch result {
-                case .success:
-                    group.cancelAll()
-                    return result
-                case .failure(let message):
-                    if !message.isEmpty { lastFailure = message }
-                case .skipped:
-                    break
+            guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+            if case .success(let route) = localOutcome {
+                print("RF5.4.3-R3.3 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
+                updateLocalRecord(for: lamp) { record in
+                    record.route = route
+                    record.online = true
                 }
+                return
             }
-            return .failure(lastFailure)
+            if case .failure(let message) = localOutcome, !message.isEmpty {
+                lastFailure = message
+            }
         }
 
+        // Cloud is a second-stage fallback only. If LAN/BLE is working, this
+        // branch is never entered and Cloud cannot interfere with local control
+        // or the displayed route.
         guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
-        switch outcome {
-        case .success(let route):
-            print("RF5.4.3 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
-            updateLocalRecord(for: lamp) { record in
-                record.route = route
-                record.online = true
+        if orderedRoutes.contains(.cloud) {
+            let liveLamp = freshestLampRecord(for: lamp)
+            if routeCanBeAttempted(.cloud, lamp: liveLamp) {
+                do {
+                    let route = try await attemptOrderedRoute(.cloud, lamp: lamp, intent: intent)
+                    print("RF5.4.3-R3.3 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
+                    updateLocalRecord(for: lamp) { record in
+                        record.route = route
+                        record.online = true
+                    }
+                    return
+                } catch {
+                    lastFailure = error.localizedDescription
+                }
             }
-        case .failure(let message):
-            throw AppError.message(message)
-        case .skipped:
-            return
         }
+
+        throw AppError.message(lastFailure)
     }
 
     private func attemptOrderedRoute(
@@ -1387,9 +1407,26 @@ final class AppViewModel: ObservableObject {
 
     private func markWiFiFailure(for lamp: LampRecord) {
         let key = lamp.id.uppercased()
-        for stateKey in stateKeys(for: lamp) { wifiConfirmedAt.removeValue(forKey: stateKey) }
         let failures = (localFailureCounts[key] ?? 0) + 1
         localFailureCounts[key] = failures
+
+        // RF5.4.3-R3.3 physical fix: one transient Local-WS/HTTP miss must not
+        // erase the last proven LAN lease and make the card say Offline merely
+        // because Cloud is also down. Only revoke the lease after three
+        // consecutive local failures AND no validated realtime socket remains.
+        let realtimeStillHealthy: Bool
+        if let host = lamp.localHost {
+            realtimeStillHealthy = local.isRealtimeHealthy(
+                host: host,
+                expectedLampID: lamp.physicalLocalIDNormalized
+            )
+        } else {
+            realtimeStillHealthy = false
+        }
+        if failures >= 3 && !realtimeStillHealthy {
+            for stateKey in stateKeys(for: lamp) { wifiConfirmedAt.removeValue(forKey: stateKey) }
+        }
+
         updateLocalRecord(for: lamp) { record in
             // RF5.2.1: a remembered host is identity/recovery metadata, not a
             // liveness bit. Never erase it merely because transient LAN probes
@@ -1720,52 +1757,21 @@ final class AppViewModel: ObservableObject {
             }
         }
 
-        // RF5.4 same-ID cloud hedge. A half-dead /ws/app path gets only a
-        // 220 ms head start; REST status verification begins in parallel rather
-        // than after a 2.4 s WebSocket timeout. Both paths refer to the exact
-        // same durable command, so Render/ESP idempotency makes the race safe.
+        // RF5.4.3-R3.3: do not fire WS and REST for the same Cloud command in
+        // parallel. Hardware logs showed this producing repeated Prisma
+        // commandId collisions and unnecessary ingress pressure. Prefer the
+        // authenticated realtime socket; only if it fails, send the SAME ID
+        // through REST. ESP/Render idempotency still protects the ACK-lost case.
         if cloudConnected {
-            let outcome = await withTaskGroup(of: CloudAttemptOutcome.self, returning: CloudAttemptOutcome.self) { group in
-                group.addTask { [weak self] in
-                    guard let self else { return .failure("Cloud controller was released.") }
-                    do {
-                        try await self.sendCloudWebSocketOrderedCommand(lampID: normalizedLampID, intent: intent)
-                        return .success
-                    } catch {
-                        return .failure(error.localizedDescription)
-                    }
-                }
-                group.addTask { [weak self] in
-                    guard let self else { return .failure("Cloud controller was released.") }
-                    try? await Task.sleep(for: .milliseconds(220))
-                    guard !Task.isCancelled else { return .failure("Cloud REST hedge cancelled.") }
-                    do {
-                        try await self.sendCloudRESTOrderedCommand(lampID: normalizedLampID, intent: intent)
-                        return .success
-                    } catch {
-                        return .failure(error.localizedDescription)
-                    }
-                }
-
-                var lastFailure = "The lamp did not acknowledge the cloud command."
-                while let result = await group.next() {
-                    switch result {
-                    case .success:
-                        group.cancelAll()
-                        return .success
-                    case .failure(let message):
-                        if !message.isEmpty { lastFailure = message }
-                    }
-                }
-                return .failure(lastFailure)
-            }
-
-            switch outcome {
-            case .success:
+            do {
+                try await sendCloudWebSocketOrderedCommand(
+                    lampID: normalizedLampID,
+                    intent: intent
+                )
                 lastCloudMutationAt.removeValue(forKey: normalizedLampID)
                 return
-            case .failure(let message):
-                throw AppError.message(message)
+            } catch {
+                // Continue immediately to bounded REST semantic-ACK fallback.
             }
         }
 
@@ -1780,7 +1786,7 @@ final class AppViewModel: ObservableObject {
             action: intent.action,
             value: intent.value,
             commandID: intent.commandID,
-            timeout: 0.75
+            timeout: 0.60
         )
         if ack.bool("success") == false {
             throw AppError.message(firstNonBlank(ack.string("error"), "The lamp rejected the cloud command."))
@@ -1880,9 +1886,11 @@ final class AppViewModel: ObservableObject {
 
     private func activateLocalWiFiRecovery() {
         wifiAttachedAt = Date()
-        // HTTP proof belongs to the previous attachment. A validated protocol-v3
-        // realtime state can immediately prove the new attachment.
-        wifiConfirmedAt.removeAll()
+        // R3.3 physical fix: do NOT erase the last validated LAN lease merely
+        // because the Wi-Fi monitor emitted a fresh attachment event. iOS can
+        // bounce path/interface callbacks while the same authenticated Local WS
+        // is reconnecting. The 30-second TTL + three-failure revocation below
+        // bounds stale evidence without manufacturing an Offline gap.
         let remembered = Array(localRecords.values.filter { $0.localHost != nil })
         for record in remembered {
             guard let host = record.localHost else { continue }

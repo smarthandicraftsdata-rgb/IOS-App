@@ -62,13 +62,13 @@ for swift_file in sorted(IOS.rglob("*.swift")):
         errors.append(f"Swift file not referenced by Xcode project: {swift_file.relative_to(ROOT)}")
 for expected in [
     "SHLAMP", "com.smarthandicrafts.shlamp", "IPHONEOS_DEPLOYMENT_TARGET = 17.0",
-    "MARKETING_VERSION = 1.8.4", "CURRENT_PROJECT_VERSION = 26",
+    "MARKETING_VERSION = 1.8.5", "CURRENT_PROJECT_VERSION = 27",
 ]:
     if expected not in pbx_text: errors.append(f"Xcode project is missing setting: {expected}")
-if pbx_text.count("MARKETING_VERSION = 1.8.4") != 2:
-    errors.append("Expected Debug and Release MARKETING_VERSION 1.8.4")
-if pbx_text.count("CURRENT_PROJECT_VERSION = 26") != 2:
-    errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 26")
+if pbx_text.count("MARKETING_VERSION = 1.8.5") != 2:
+    errors.append("Expected Debug and Release MARKETING_VERSION 1.8.5")
+if pbx_text.count("CURRENT_PROJECT_VERSION = 27") != 2:
+    errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 27")
 
 try:
     import yaml  # type: ignore
@@ -111,12 +111,12 @@ checks = {
     ],
     "CloudRealtimeClient.swift": ["timeout: TimeInterval = 0.75", "Task.sleep(for: .seconds(4))"],
     "AppViewModel.swift": [
-        "private let routeHedgeDelayMs = 180", "base = [.bluetooth, .wifi, .cloud]",
-        "there is deliberately NO Cloud→LAN time fence", "timeout: 0.75", "timeout: 1.6",
-        "Task.sleep(for: .milliseconds(220))", "same-ID cloud hedge",
+        "private let routeHedgeDelayMs = 120", "base = [.bluetooth, .wifi, .cloud]",
+        "there is deliberately NO Cloud→LAN time fence", "timeout: 0.60", "timeout: 1.6",
+        "Cloud NEVER runs in parallel with a usable local route", "do not fire WS and REST for the same Cloud command in",
         "record.route = self.selectedRoute(for: record, local: record, cloud: cloud)",
         "physicalLocalIDNormalized", "cloudIDNormalized", "setOutputState",
-        "durableDeliveryRetryDelaysMs = [0, 140, 320]", "reissuedForTransportRetry",
+        "durableDeliveryRetryDelaysMs = [0, 450, 1_100]", "reissuedForTransportRetry",
         "RF5.4.3 CMD retry",
         "wifiInterfaceMonitor", "localWiFiAvailable",
         "guard localWiFiAvailable else { return false }",
@@ -155,7 +155,7 @@ sha = hashlib.sha256("".join(sorted(p.read_text() for p in swift_files)).encode(
 print("PROJECT VERIFICATION PASSED")
 print(f"Swift files: {len(swift_files)}")
 print(f"Swift source SHA-256: {sha}")
-print("iOS version: 1.8.4 (26)")
+print("iOS version: 1.8.5 (27)")
 print("RF5.4.3 routing/control invariants: passed")
 print("Core source integrity: passed")
 print("Codemagic workflow: ios-unsigned-sideloadly")
