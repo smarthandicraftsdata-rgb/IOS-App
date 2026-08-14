@@ -1,4 +1,4 @@
-# SH Lamp iOS 1.8.3 build 25 — RF5.4.3 Cloud Final Reliability R3
+# SH Lamp iOS 1.8.4 build 26 — RF5.4.3-R3.1 Physical Connection Recovery
 
 This R3 exists specifically for the physical Cloud failure reproduced after RF5.4.2:
 
@@ -12,3 +12,9 @@ R3 keeps the RF5 ordered sequence/value unchanged but permits up to two controll
 - if the user issues a newer OFF/brightness intent, the app field generation cancels the old retry, and the ESP sequence gate rejects any leaked older retry as stale.
 
 The existing same-ID WS/REST hedge is still used inside each delivery attempt. Intermediate slider traffic remains ephemeral/latest-only; the finger-release value remains a durable ordered `setOutputState`.
+
+
+## RF5.4.3-R3.1 physical recovery
+- A validated Local WS now proves LAN health even if iOS selects cellular as the default internet path.
+- A dedicated `NWPathMonitor(requiredInterfaceType: .wifi)` drives LAN discovery/recovery independently of the default Cloud path.
+- R3 durable final-command fresh-ID/same-sequence recovery is retained unchanged.

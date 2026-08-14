@@ -422,7 +422,7 @@ final class LocalLampController: NSObject {
         request.timeoutInterval = 1.0
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.8.3-RF5.4.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.4-RF5.4.3-R3.1", forHTTPHeaderField: "User-Agent")
         request.httpBody = try jsonData(orderedObject(intent))
         let (data, response) = try await controlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -752,7 +752,7 @@ final class LocalLampController: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.15
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.8.3-RF5.4.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/1.8.4-RF5.4.3-R3.1", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await controlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? ""

@@ -54,8 +54,8 @@ with (IOS / "Info.plist").open("rb") as handle: plist = plistlib.load(handle)
 if plist.get("CFBundleShortVersionString") != "$(MARKETING_VERSION)": errors.append("Info.plist marketing version is not inherited from Xcode")
 if plist.get("CFBundleVersion") != "$(CURRENT_PROJECT_VERSION)": errors.append("Info.plist build number is not inherited from Xcode")
 pbx = (ROOT / "iosApp/SHLAMP.xcodeproj/project.pbxproj").read_text()
-if pbx.count("MARKETING_VERSION = 1.8.3") != 2: errors.append("Expected Debug and Release MARKETING_VERSION 1.8.3")
-if pbx.count("CURRENT_PROJECT_VERSION = 25") != 2: errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 24")
+if pbx.count("MARKETING_VERSION = 1.8.4") != 2: errors.append("Expected Debug and Release MARKETING_VERSION 1.8.4")
+if pbx.count("CURRENT_PROJECT_VERSION = 26") != 2: errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 26")
 
 expected_hashes = json.loads((ROOT / "docs/RF5.4.3_SOURCE_SHA256.json").read_text())
 for name, expected in expected_hashes.items():

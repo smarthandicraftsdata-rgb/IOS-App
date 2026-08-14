@@ -190,7 +190,13 @@ final class AppViewModel: ObservableObject {
     private var connectedLocalID = ""
     private var refreshTask: Task<Void, Never>?
     private let pathMonitor = NWPathMonitor()
+    // RF5.4.3-R3.1: The default NWPath can legitimately prefer cellular even
+    // while an authenticated Local WS remains alive on Wi-Fi. Track Wi-Fi as
+    // an independently usable interface so route-health does not collapse to
+    // Offline merely because iOS changed its default internet route.
+    private let wifiInterfaceMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let pathQueue = DispatchQueue(label: "com.smarthandicrafts.shlamp.network")
+    private let wifiInterfaceQueue = DispatchQueue(label: "com.smarthandicrafts.shlamp.network.wifi")
     private let localStoreKey = "shlamp.ios.localRecords.v2"
     private var manualAddFlowActive = false
     private var transientLocalIDs: Set<String> = []
@@ -199,6 +205,7 @@ final class AppViewModel: ObservableObject {
     private var pendingAutoConnectPeripheralID: UUID?
     private var probedPeripheralIDs: Set<UUID> = []
     private var wifiPathAvailable = false
+    private var wifiInterfaceAvailable = false
     private var wifiAttachedAt: Date?
     private var cloudReconcileTask: Task<Void, Never>?
     private var cloudSessionRefreshTask: Task<CloudSession, Error>?
@@ -478,6 +485,10 @@ final class AppViewModel: ObservableObject {
         return lamps.first(where: { $0.canonicalID == record.canonicalID || $0.id == record.id })
     }
 
+    private var localWiFiAvailable: Bool {
+        wifiPathAvailable || wifiInterfaceAvailable
+    }
+
     func setRoutePreference(_ lamp: LampRecord, preference: LampRoutePreference) {
         updateLocalRecord(for: lamp) { $0.routePreference = preference }
         notice = "Connection set to \(preference.label)."
@@ -485,7 +496,7 @@ final class AppViewModel: ObservableObject {
         case .bluetooth:
             if !canUseBLE(lamp) { ble.startScan() }
         case .wifi, .automatic:
-            if wifiPathAvailable { local.startDiscovery() }
+            if localWiFiAvailable { local.startDiscovery() }
             if preference == .automatic && !canUseBLE(lamp) { ble.startScan() }
         case .remote:
             rebuildLamps()
@@ -1425,7 +1436,7 @@ final class AppViewModel: ObservableObject {
         localPollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                if self.wifiPathAvailable {
+                if self.localWiFiAvailable {
                     let records = self.localRecords.values
                         .filter { $0.localHost != nil }
                         .sorted { $0.canonicalID < $1.canonicalID }
@@ -1533,7 +1544,7 @@ final class AppViewModel: ObservableObject {
         // LAN recovery is independent of Cloud. When the phone and lamp are on
         // the same Wi-Fi, keep reopening the known protocol-v3 endpoint and
         // periodically refresh Bonjour even if Render is completely offline.
-        if wifiPathAvailable {
+        if localWiFiAvailable {
             for record in localCandidates.prefix(2) {
                 guard let host = record.localHost, !isWiFiHealthy(record, now: now) else { continue }
                 local.recoverRealtime(host: host, expectedLampID: record.physicalLocalIDNormalized)
@@ -1578,7 +1589,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func isWiFiHealthy(_ lamp: LampRecord, now: Date = Date()) -> Bool {
-        guard wifiPathAvailable, let host = lamp.localHost, lamp.physicalLocalIDNormalized != nil else { return false }
+        guard let host = lamp.localHost, lamp.physicalLocalIDNormalized != nil else { return false }
         let keys = stateKeys(for: lamp)
         // RF5.4: there is deliberately NO Cloud→LAN time fence. Every ordered
         // route carries the same controller/session/sequence identity, so an
@@ -1594,6 +1605,11 @@ final class AppViewModel: ObservableObject {
         // show Offline even while the ESP logged a connected local realtime
         // client.
         if local.isRealtimeHealthy(host: host, expectedLampID: lamp.physicalLocalIDNormalized, now: now) { return true }
+
+        // A validated Local WS is stronger evidence than the phone's default
+        // route. If no realtime proof exists, only then require an available
+        // Wi-Fi interface before trusting bounded HTTP liveness evidence.
+        guard localWiFiAvailable else { return false }
 
         // If realtime is unavailable, retain the bounded HTTP liveness fallback.
         guard let last = keys.compactMap({ wifiConfirmedAt[$0] }).max() else { return false }
@@ -1862,6 +1878,55 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func activateLocalWiFiRecovery() {
+        wifiAttachedAt = Date()
+        // HTTP proof belongs to the previous attachment. A validated protocol-v3
+        // realtime state can immediately prove the new attachment.
+        wifiConfirmedAt.removeAll()
+        let remembered = Array(localRecords.values.filter { $0.localHost != nil })
+        for record in remembered {
+            guard let host = record.localHost else { continue }
+            local.startRealtime(host: host, expectedLampID: record.physicalLocalIDNormalized)
+            let key = record.id.uppercased()
+            guard !localPollInFlight.contains(key) else { continue }
+            localPollInFlight.insert(key)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.localPollInFlight.remove(key) }
+                let requestStartedAt = Date()
+                if let snapshot = try? await self.local.readStatus(host: host) {
+                    self.apply(snapshot: snapshot, observedAt: requestStartedAt)
+                } else {
+                    // Do not throw away a remembered host after one transition-time
+                    // miss. Normal realtime/poll recovery keeps trying independently.
+                    self.rebuildLamps()
+                }
+            }
+        }
+        local.restartDiscovery()
+    }
+
+    private func deactivateLocalWiFiIfUnavailable() {
+        // Never tear down a validated realtime route just because iOS selected
+        // cellular as its default internet route. Only stop discovery / downgrade
+        // when neither the default path nor the dedicated Wi-Fi monitor sees Wi-Fi.
+        guard !localWiFiAvailable else { return }
+        wifiAttachedAt = nil
+        local.stopDiscovery()
+        wifiConfirmedAt.removeAll()
+        for key in Array(localRecords.keys) {
+            guard var record = localRecords[key], record.route == .wifi else { continue }
+            let cloud = record.cloudLampId.flatMap { cloudID in
+                dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
+            }
+            record.route = self.selectedRoute(for: record, local: record, cloud: cloud)
+            record.online = record.route != .offline
+            localRecords[key] = record
+        }
+        persistLocalRecords()
+        rebuildLamps()
+    }
+
     private func startNetworkMonitor() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let hasWiFi = path.status == .satisfied && path.usesInterfaceType(.wifi)
@@ -1872,77 +1937,42 @@ final class AppViewModel: ObservableObject {
                 guard changed else { return }
 
                 // RF4: explicitly rebind the account WebSocket whenever the
-                // iPhone changes between cellular and Wi-Fi. Leaving an old TCP
-                // WebSocket attached to the previous interface can otherwise
-                // produce several seconds of "cloud disconnected" or a half-dead
-                // socket after the route changes.
+                // iPhone changes between cellular and Wi-Fi. The Cloud route is
+                // governed by the default internet path; LAN is governed separately
+                // by the dedicated Wi-Fi monitor + validated Local WS.
                 if path.status == .satisfied, let currentSession = self.session {
                     self.realtime.start(
                         token: currentSession.accessToken,
                         homeID: self.dashboard.homes.first?.id ?? "default",
                         force: true
                     )
-                    // Reconcile the backend's current device-online flags by
-                    // REST as well. This is intentionally independent of the
-                    // app WebSocket so a half-open/rebinding live socket cannot
-                    // leave the UI stuck Offline.
                     self.scheduleCloudRouteReconciliation()
                 }
 
                 if hasWiFi {
-                    self.wifiAttachedAt = Date()
-                    // RF5.2 make-before-break: clear HTTP proof from the old
-                    // attachment, but allow a validated protocol-v3 realtime
-                    // state to promote LAN immediately on the new Wi-Fi path.
-                    self.wifiConfirmedAt.removeAll()
-                    let remembered = Array(self.localRecords.values.filter { $0.localHost != nil })
-                    for record in remembered {
-                        guard let host = record.localHost else { continue }
-                        self.local.startRealtime(host: host, expectedLampID: record.physicalLocalIDNormalized)
-                        let key = record.id.uppercased()
-                        guard !self.localPollInFlight.contains(key) else { continue }
-                        self.localPollInFlight.insert(key)
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            defer { self.localPollInFlight.remove(key) }
-                            let requestStartedAt = Date()
-                            if let snapshot = try? await self.local.readStatus(host: host) {
-                                self.apply(snapshot: snapshot, observedAt: requestStartedAt)
-                            } else {
-                                // Do not throw away a remembered host after one
-                                // transition-time miss. The normal polling/failure
-                                // policy will retry and fall through to BLE/cloud.
-                                self.rebuildLamps()
-                            }
-                        }
-                    }
-                    // Force a fresh Bonjour generation on every Wi-Fi
-                    // attachment. startDiscovery() alone is a no-op when the
-                    // browser is already marked running and can leave a stale
-                    // discoveredHosts cache blocking recovery.
-                    self.local.restartDiscovery()
+                    self.activateLocalWiFiRecovery()
                 } else {
-                    self.wifiAttachedAt = nil
-                    self.local.stopDiscovery()
-                    self.wifiConfirmedAt.removeAll()
-                    for key in Array(self.localRecords.keys) {
-                        guard var record = self.localRecords[key], record.route == .wifi else { continue }
-                        let cloud = record.cloudLampId.flatMap { cloudID in
-                            self.dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
-                        }
-                        // Make-before-break route ownership: Wi-Fi disappearing
-                        // does not force a transient Offline badge while BLE or
-                        // an authenticated/online Cloud path is already usable.
-                        record.route = self.selectedRoute(for: record, local: record, cloud: cloud)
-                        record.online = record.route != .offline
-                        self.localRecords[key] = record
-                    }
-                    self.persistLocalRecords()
-                    self.rebuildLamps()
+                    self.deactivateLocalWiFiIfUnavailable()
                 }
             }
         }
         pathMonitor.start(queue: pathQueue)
+
+        wifiInterfaceMonitor.pathUpdateHandler = { [weak self] path in
+            let available = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let changed = self.wifiInterfaceAvailable != available
+                self.wifiInterfaceAvailable = available
+                guard changed else { return }
+                if available {
+                    self.activateLocalWiFiRecovery()
+                } else {
+                    self.deactivateLocalWiFiIfUnavailable()
+                }
+            }
+        }
+        wifiInterfaceMonitor.start(queue: wifiInterfaceQueue)
     }
 
     private func restoreLocalRecords() {
