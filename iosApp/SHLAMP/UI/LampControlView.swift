@@ -45,14 +45,14 @@ struct LampControlView: View {
                     NavigationStack { LampSettingsView(lampID: lamp.id) }
                 }
                 .confirmationDialog("Connection route", isPresented: $showingRoutePicker, titleVisibility: .visible) {
-                    ForEach(LampRoutePreference.allCases) { preference in
+                    ForEach(LampRoutePreference.allCases.filter { $0 != .remote }) { preference in
                         Button(preference.label + (lamp.routePreference == preference ? " ✓" : "")) {
                             model.setRoutePreference(lamp, preference: preference)
                         }
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("Automatic uses the best healthy route: Bluetooth or Local Wi-Fi nearby, then Remote when needed.")
+                    Text("Devices uses local control only: Bluetooth first, then Local Wi-Fi. Remote Cloud control is in the separate Remote tab.")
                 }
                 .alert(item: $pendingPowerMode) { mode in
                     Alert(

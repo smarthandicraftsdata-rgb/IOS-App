@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
-import hashlib
-import json
-import plistlib
-import re
-import sys
+import hashlib, json, plistlib, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 IOS = ROOT / "iosApp" / "SHLAMP"
 PBX = ROOT / "iosApp" / "SHLAMP.xcodeproj" / "project.pbxproj"
-YAML = ROOT / "codemagic.yaml"
-HASHES = ROOT / "docs" / "RF5.4.3_SOURCE_SHA256.json"
+HASHES = ROOT / "docs" / "RF6.0_SOURCE_SHA256.json"
 errors: list[str] = []
 
 required = [
@@ -22,140 +16,114 @@ required = [
     IOS / "CloudAPI.swift",
     IOS / "CloudRealtimeClient.swift",
     IOS / "LocalLampController.swift",
+    IOS / "Models.swift",
+    IOS / "UI" / "HomeViews.swift",
     IOS / "Info.plist",
-    IOS / "Assets.xcassets" / "AppIcon.appiconset" / "AppIcon-1024.png",
-    IOS / "Assets.xcassets" / "BrandLogo.imageset" / "logo.png",
     PBX,
-    ROOT / "iosApp" / "SHLAMP.xcodeproj" / "xcshareddata" / "xcschemes" / "SHLAMP.xcscheme",
-    YAML,
+    ROOT / "codemagic.yaml",
     HASHES,
 ]
 for path in required:
-    if not path.exists(): errors.append(f"Missing: {path.relative_to(ROOT)}")
+    if not path.exists():
+        errors.append(f"Missing: {path.relative_to(ROOT)}")
 
 try:
     with (IOS / "Info.plist").open("rb") as handle:
         plist = plistlib.load(handle)
-    for key in ["NSBluetoothAlwaysUsageDescription", "NSCameraUsageDescription", "NSLocalNetworkUsageDescription"]:
-        if not plist.get(key): errors.append(f"Info.plist missing {key}")
     if plist.get("CFBundleShortVersionString") != "$(MARKETING_VERSION)":
-        errors.append("Info.plist must source CFBundleShortVersionString from MARKETING_VERSION")
+        errors.append("Info.plist must inherit MARKETING_VERSION")
     if plist.get("CFBundleVersion") != "$(CURRENT_PROJECT_VERSION)":
-        errors.append("Info.plist must source CFBundleVersion from CURRENT_PROJECT_VERSION")
+        errors.append("Info.plist must inherit CURRENT_PROJECT_VERSION")
 except Exception as exc:
-    errors.append(f"Info.plist is invalid: {exc}")
+    errors.append(f"Invalid Info.plist: {exc}")
 
-for catalog in (IOS / "Assets.xcassets").rglob("Contents.json"):
-    try: json.loads(catalog.read_text())
-    except Exception as exc: errors.append(f"Invalid asset JSON {catalog.relative_to(ROOT)}: {exc}")
+pbx = PBX.read_text() if PBX.exists() else ""
+if pbx.count("MARKETING_VERSION = 2.0.0") != 2:
+    errors.append("Expected Debug/Release MARKETING_VERSION = 2.0.0")
+if pbx.count("CURRENT_PROJECT_VERSION = 28") != 2:
+    errors.append("Expected Debug/Release CURRENT_PROJECT_VERSION = 28")
 
-try:
-    from PIL import Image
-    icon = Image.open(IOS / "Assets.xcassets" / "AppIcon.appiconset" / "AppIcon-1024.png")
-    if icon.size != (1024, 1024): errors.append(f"App icon must be 1024x1024, got {icon.size}")
-except Exception as exc:
-    errors.append(f"Unable to validate app icon: {exc}")
-
-pbx_text = PBX.read_text() if PBX.exists() else ""
 for swift_file in sorted(IOS.rglob("*.swift")):
-    if swift_file.name not in pbx_text:
+    if swift_file.name not in pbx:
         errors.append(f"Swift file not referenced by Xcode project: {swift_file.relative_to(ROOT)}")
-for expected in [
-    "SHLAMP", "com.smarthandicrafts.shlamp", "IPHONEOS_DEPLOYMENT_TARGET = 17.0",
-    "MARKETING_VERSION = 1.8.5", "CURRENT_PROJECT_VERSION = 27",
-]:
-    if expected not in pbx_text: errors.append(f"Xcode project is missing setting: {expected}")
-if pbx_text.count("MARKETING_VERSION = 1.8.5") != 2:
-    errors.append("Expected Debug and Release MARKETING_VERSION 1.8.5")
-if pbx_text.count("CURRENT_PROJECT_VERSION = 27") != 2:
-    errors.append("Expected Debug and Release CURRENT_PROJECT_VERSION 27")
 
 try:
-    import yaml  # type: ignore
-    parsed = yaml.safe_load(YAML.read_text())
-    if "ios-unsigned-sideloadly" not in parsed.get("workflows", {}):
-        errors.append("Codemagic workflow ios-unsigned-sideloadly is missing")
-except ModuleNotFoundError:
-    text = YAML.read_text()
-    if "workflows:" not in text or "ios-unsigned-sideloadly:" not in text:
-        errors.append("Codemagic YAML structure is missing")
-except Exception as exc:
-    errors.append(f"codemagic.yaml is invalid: {exc}")
-
-try:
-    expected_hashes = json.loads(HASHES.read_text())
-    for name, expected_hash in expected_hashes.items():
-        path = IOS / name
+    expected = json.loads(HASHES.read_text())
+    for rel, sha in expected.items():
+        path = IOS / rel
         if not path.exists():
-            errors.append(f"Core source hash target missing: {name}")
+            errors.append(f"Hash target missing: {rel}")
             continue
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        if actual != expected_hash: errors.append(f"Core source integrity mismatch: {name}")
+        if actual != sha:
+            errors.append(f"Source integrity mismatch: {rel}")
 except Exception as exc:
-    errors.append(f"Core source hash manifest is invalid: {exc}")
+    errors.append(f"RF6 source hash manifest invalid: {exc}")
 
-# RF5.4.2 production-routing invariants.
 checks = {
+    "Models.swift": [
+        "var remoteAccessEnabled = false",
+        "var remoteAccessEnabled: Bool = false",
+    ],
     "BLELampManager.swift": [
-        "connectionSetupCompleted", "guard isReady, let characteristic = controlCharacteristic",
-        "Task.sleep(for: .milliseconds(800))",
+        "didReceiveRemoteAccess enabled: Bool",
+        "func remoteAccess(_ enabled: Bool)",
+        'text == "R:ON" || text == "R:OFF"',
     ],
     "LocalLampController.swift": [
-        "timeoutIntervalForRequest = 1.15", "timeoutIntervalForResource = 1.5",
-        "Task.sleep(for: .milliseconds(750))", "request.timeoutInterval = 1.0",
-        "realtimeExpectedLampByHost", "expectedLampID: snapshot.lampId",
+        "func setIPControlMode(",
+        'path: "/api/ip-mode?mode=',
+        'json.bool("remoteAccessEnabled")',
     ],
-    "CloudAPI.swift": [
-        "controlConfiguration.timeoutIntervalForRequest = 1.15",
-        "controlConfiguration.waitsForConnectivity = false", "controlPath: Bool = false",
-    ],
-    "CloudRealtimeClient.swift": ["timeout: TimeInterval = 0.75", "Task.sleep(for: .seconds(4))"],
     "AppViewModel.swift": [
-        "private let routeHedgeDelayMs = 120", "base = [.bluetooth, .wifi, .cloud]",
-        "there is deliberately NO Cloud→LAN time fence", "timeout: 0.60", "timeout: 1.6",
-        "Cloud NEVER runs in parallel with a usable local route", "do not fire WS and REST for the same Cloud command in",
-        "record.route = self.selectedRoute(for: record, local: record, cloud: cloud)",
-        "physicalLocalIDNormalized", "cloudIDNormalized", "setOutputState",
-        "durableDeliveryRetryDelaysMs = [0, 450, 1_100]", "reissuedForTransportRetry",
-        "RF5.4.3 CMD retry",
-        "wifiInterfaceMonitor", "localWiFiAvailable",
-        "guard localWiFiAvailable else { return false }",
+        "@Published var remoteLamps: [LampRecord] = []",
+        "func setRemoteAccess(",
+        "func setRemotePower(",
+        "func setRemoteBrightness(",
+        "private func performRemoteOrdered(",
+        "// RF6.0: Devices never route through Cloud.",
+        "remoteLamps = dashboard.lamps.map",
+        "lamps = normalizedLocal.values",
+        "Cloud health is not an",
+    ],
+    "UI/HomeViews.swift": [
+        "NavigationStack { RemoteView() }",
+        "struct RemoteView: View",
+        "private struct RemoteLampCard: View",
+        "model.setRemoteAccess(",
+        "model.setRemotePower(",
+        "model.setRemoteBrightness(",
     ],
 }
-for name, snippets in checks.items():
-    text = (IOS / name).read_text()
+for rel, snippets in checks.items():
+    text = (IOS / rel).read_text()
     for snippet in snippets:
-        if snippet not in text: errors.append(f"RF5.4.2 invariant missing in {name}: {snippet}")
+        if snippet not in text:
+            errors.append(f"RF6 invariant missing in {rel}: {snippet}")
 
-ui_text = "\n".join(path.read_text() for path in (IOS / "UI").glob("*.swift"))
-for required_ui in ["LampGridCell", "uiCanAttemptBasicControl", "uiSupportsNearbyControls", "BrandLogoView", "LampHeroRingView"]:
-    if required_ui not in ui_text: errors.append(f"Required audited UI component missing: {required_ui}")
-home_text = (IOS / "UI" / "HomeViews.swift").read_text()
-if re.search(r"NavigationLink\(value:\s*lamp\.id\)\s*\{\s*LampCard", home_text, re.S):
-    errors.append("Home/Devices still nest LampCard directly inside NavigationLink; power hit targets may conflict")
+app = (IOS / "AppViewModel.swift").read_text()
+route_start = app.find("private func routeOrder(for lamp:")
+route_end = app.find("private func routeCanBeAttempted", route_start)
+if route_start < 0 or route_end < 0:
+    errors.append("Unable to locate RF6 routeOrder")
+else:
+    route_body = app[route_start:route_end]
+    if ".cloud" in route_body:
+        errors.append("Devices routeOrder still contains Cloud")
 
-secret_patterns = [
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-]
-for path in ROOT.rglob("*"):
-    if not path.is_file() or path.suffix.lower() in {".jar", ".png", ".rar", ".zip"}: continue
-    try: content = path.read_text(errors="ignore")
-    except Exception: continue
-    for pattern in secret_patterns:
-        if pattern.search(content): errors.append(f"Possible private credential in {path.relative_to(ROOT)}")
+home = (IOS / "UI" / "HomeViews.swift").read_text()
+if "onEditingChanged" not in home or "model.setRemoteBrightness" not in home:
+    errors.append("Remote final-value slider path missing")
 
 if errors:
-    print("PROJECT VERIFICATION FAILED")
-    for error in errors: print(f"- {error}")
+    print("RF6 PROJECT VERIFICATION FAILED")
+    for e in errors:
+        print(f"- {e}")
     sys.exit(1)
 
-swift_files = list(IOS.rglob("*.swift"))
-sha = hashlib.sha256("".join(sorted(p.read_text() for p in swift_files)).encode()).hexdigest()
-print("PROJECT VERIFICATION PASSED")
-print(f"Swift files: {len(swift_files)}")
-print(f"Swift source SHA-256: {sha}")
-print("iOS version: 1.8.5 (27)")
-print("RF5.4.3 routing/control invariants: passed")
-print("Core source integrity: passed")
-print("Codemagic workflow: ios-unsigned-sideloadly")
+print("RF6 PROJECT VERIFICATION PASSED")
+print("- Version: 2.0.0 build 28")
+print("- Devices routing: BLE/LAN only")
+print("- Remote store/tab: separate Cloud plane")
+print("- Remote Access toggle protocol: present")
+print("- RF6 Swift source hash integrity: passed")

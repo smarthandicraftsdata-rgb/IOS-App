@@ -1,0 +1,21 @@
+{
+  "AppEnvironment.swift": "0acb99e26618d4d4463a486c4b3ae575843fcdd44b7ac290cd300fa3aa0fc147",
+  "AppViewModel.swift": "e0797cb3d1de050dd18ecd6d19d566cc11078314f79c8e8b4f07de5a1345dad1",
+  "BLELampManager.swift": "dd2f55acb153e3ad726114b00aa71675efec964e2ffa590639a7fe9ac2f44adb",
+  "CloudAPI.swift": "73d8413f11eb377fade78c4531b4f35f9fe2e273a62a5a7c15715202c17157e3",
+  "CloudRealtimeClient.swift": "0bf6958541d828cc4f3dbe6da2eca925726f5253305bf872a8e9ecdc2ddad6fe",
+  "JSONHelpers.swift": "d5a420ef78c7c78d1e1a1bf9ae0657042b04522530116347f8f21e20ca5c3688",
+  "KeychainStore.swift": "713ded7841ed7c64976429dfe8b313f674bf38fa616c9f3331172f49b5bcc067",
+  "LampQRParser.swift": "6d3bb8ca91417013de6cdfdc8a14561816d32b3a344a4d5bf82d9d17d9d234be",
+  "LocalLampController.swift": "f5ba806db89e464283e56249e8c38b06bc3f86e83607d7f2d2b2c8d312d36cd2",
+  "Models.swift": "57b27b4337b4b18ee1d3fd66bd47e8ac6f19b871e0b563963e499cc8afe6c7e6",
+  "QRScannerView.swift": "741928fcca7710b914bb03a71ec02e5acd0c89d0598b6c5fa02d58c1df5ac682",
+  "SHLAMPApp.swift": "90dd92e9a77bac8176b81ad474fd6f2d7ffe2caff716a9e58ddaa740b44ab1b4",
+  "UI/AccountView.swift": "ea7dfd22d127ac20c965e3af9ed6d17b48cb1d235354a95ac8df4f2dee4acc1a",
+  "UI/AddLampView.swift": "7bc0f7bdbff8c66d2144f9028f73d3bf16a356f9c4e801872b85f90b2ea6e3b6",
+  "UI/DiagnosticsView.swift": "9016d37f669fb2fe4423e97e1270efd9151551edae3fc6f73fbec4291debaddd",
+  "UI/HomeViews.swift": "622b260424c5c8769e55986747faeb21a95ce2be0b367c5d6e5171ef89ea3174",
+  "UI/LampCard.swift": "74c488153ff64b24337bef7a642f6a475a0f12b6f4e8407f34be9b493a779929",
+  "UI/LampControlView.swift": "6761199216ea99b5d9b56f056c397abc112874bf0f3c2565b6b69564451bca96",
+  "UI/Theme.swift": "b9ca63e71228e9eb4d5ff9df8e6bd88e76c4683af01e81d6f4d844e8298130a6"
+}

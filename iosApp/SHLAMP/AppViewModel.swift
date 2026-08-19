@@ -159,7 +159,11 @@ final class AppViewModel: ObservableObject {
     }
     @Published var currentUser: CloudUser?
     @Published var dashboard: Dashboard = .empty
+    /// RF6.0: local Devices and account Remote representations are separate
+    /// stores. Cloud state never participates in Devices reachability.
     @Published var lamps: [LampRecord] = []
+    @Published var remoteLamps: [LampRecord] = []
+    @Published var remoteAccessByPhysicalID: [String: Bool] = [:]
     @Published var nearbyLamps: [NearbyLamp] = []
     @Published var savedWiFiNetworks: [SavedWiFiNetwork] = []
     @Published var controllers: [LampControllerAccess] = []
@@ -240,6 +244,10 @@ final class AppViewModel: ObservableObject {
     private var pendingBrightnessHolds: [String: (value: Int, expiresAt: Date)] = [:]
     private var pendingFadeHolds: [String: (value: Int, expiresAt: Date)] = [:]
     private var pendingTimerHolds: [String: (deadline: Date?, expiresAt: Date)] = [:]
+    // RF6.0 Remote has its own optimistic fence. A delayed Cloud state cannot
+    // overwrite a just-issued Remote power/final-brightness intent, and local
+    // BLE/LAN state never participates in this fence.
+    private var remotePendingOutput: [String: (power: Bool, brightness: Int, expiresAt: Date)] = [:]
 
     private var localFailureCounts: [String: Int] = [:]
     // RF4: each logical control field is latest-wins inside the app.
@@ -690,6 +698,125 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    // MARK: - RF6.0 Remote plane
+
+    func remoteAccessEnabled(for localLamp: LampRecord) -> Bool {
+        guard let physical = localLamp.physicalLocalIDNormalized else { return localLamp.remoteAccessEnabled }
+        return remoteAccessByPhysicalID[physical] ?? localLamp.remoteAccessEnabled
+    }
+
+    func localLamp(forRemote remote: LampRecord) -> LampRecord? {
+        let cloudID = remote.cloudIDNormalized ?? remote.id.uppercased()
+        return lamps.first { $0.cloudIDNormalized?.caseInsensitiveCompare(cloudID) == .orderedSame }
+    }
+
+    func setRemoteAccess(_ localLamp: LampRecord, enabled: Bool) {
+        guard let physicalID = localLamp.physicalLocalIDNormalized else {
+            errorMessage = "The physical lamp identity is unavailable."
+            return
+        }
+        Task {
+            do {
+                if canUseBLE(localLamp) {
+                    // The ESP replies R:ON/R:OFF on the BLE Wi-Fi/status
+                    // characteristic. Do not alter Wi-Fi association.
+                    ble.remoteAccess(enabled)
+                    try? await Task.sleep(for: .milliseconds(300))
+                    if let host = localLamp.localHost,
+                       let snapshot = try? await local.readStatus(host: host) {
+                        apply(snapshot: snapshot, authoritative: true)
+                    }
+                } else if localWiFiAvailable, let host = localLamp.localHost {
+                    let snapshot = try await local.setIPControlMode(
+                        host: host,
+                        expectedLampID: physicalID,
+                        remote: enabled
+                    )
+                    apply(snapshot: snapshot, authoritative: true)
+                } else {
+                    throw AppError.message("Remote Access can be changed only while Bluetooth or the same local Wi-Fi is available.")
+                }
+            } catch {
+                handle(error)
+            }
+        }
+    }
+
+    private func makeRemoteOutputIntent(_ lamp: LampRecord, power: Bool, brightness requested: Int) -> OrderedControlIntent {
+        let maximum = lamp.state.powerMode == .maximumBackup ? 70 : 100
+        let capped = min(clamp(requested, 0...100), maximum)
+        let remembered = max(1, min(100, capped > 0 ? capped : max(lamp.state.rememberedBrightness, 20)))
+        let actual = power ? max(1, capped > 0 ? capped : remembered) : 0
+        return orderedIntents.next(
+            kind: .output,
+            action: "setOutputState",
+            valueFields: [
+                "power": power,
+                "brightness": actual,
+                "rememberedBrightness": remembered
+            ]
+        )
+    }
+
+    func setRemotePower(_ lamp: LampRecord, on: Bool) {
+        let desired = on ? max(lamp.state.brightness, max(lamp.state.rememberedBrightness, 20)) : 0
+        let intent = makeRemoteOutputIntent(lamp, power: on, brightness: desired)
+        let brightness = intent.value["brightness"] as? Int ?? 0
+        optimisticRemote(lamp, power: on, brightness: brightness)
+        Task {
+            do { try await performRemoteOrdered(lamp: lamp, intent: intent) }
+            catch { remotePendingOutput.removeValue(forKey: lamp.id.uppercased()); handle(error) }
+        }
+    }
+
+    func setRemoteBrightness(_ lamp: LampRecord, value: Int) {
+        // Remote slider is final-value only; UI drag frames are local UI state
+        // and the released value becomes one durable Cloud command.
+        let percent = clamp(value, 0...100)
+        let intent = makeRemoteOutputIntent(lamp, power: percent > 0, brightness: percent)
+        let brightness = intent.value["brightness"] as? Int ?? percent
+        optimisticRemote(lamp, power: percent > 0, brightness: brightness)
+        Task {
+            do { try await performRemoteOrdered(lamp: lamp, intent: intent) }
+            catch { remotePendingOutput.removeValue(forKey: lamp.id.uppercased()); handle(error) }
+        }
+    }
+
+    private func optimisticRemote(_ lamp: LampRecord, power: Bool, brightness: Int) {
+        let id = lamp.id.uppercased()
+        remotePendingOutput[id] = (power, brightness, Date().addingTimeInterval(10))
+        if let index = dashboard.lamps.firstIndex(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }) {
+            dashboard.lamps[index].state.power = power
+            dashboard.lamps[index].state.brightness = brightness
+            if brightness > 0 { dashboard.lamps[index].state.rememberedBrightness = brightness }
+        }
+        rebuildLamps()
+    }
+
+    private func performRemoteOrdered(lamp: LampRecord, intent: OrderedControlIntent) async throws {
+        guard let cloudID = lamp.cloudIDNormalized ?? (lamp.id.isEmpty ? nil : lamp.id.uppercased()) else {
+            throw AppError.message("Remote lamp identity is unavailable.")
+        }
+        guard isCloudHealthy(lamp) else {
+            throw AppError.message("Remote lamp is offline.")
+        }
+
+        var lastError: Error?
+        for attempt in durableDeliveryRetryDelaysMs.indices {
+            let delay = durableDeliveryRetryDelaysMs[attempt]
+            if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+            let delivery = attempt == 0 ? intent : intent.reissuedForTransportRetry(UInt8(attempt))
+            do {
+                try await sendCloudOrderedCommand(lampID: cloudID, intent: delivery)
+                return
+            } catch {
+                lastError = error
+                guard shouldRetryOrderedDelivery(after: error) else { throw error }
+            }
+        }
+        throw lastError ?? AppError.message("Remote command was not acknowledged.")
+    }
+
     /// Continuous brightness control. Every slider frame is allocated its
     /// ordering identity at the moment the UI creates it. If OFF or a final
     /// release happens later, its larger sequence makes every already-queued
@@ -1125,47 +1252,17 @@ final class AppViewModel: ObservableObject {
         generation: Int,
         field: String
     ) async throws {
-        var lastError: Error?
-
-        for attemptIndex in durableDeliveryRetryDelaysMs.indices {
-            guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
-
-            let delayMs = durableDeliveryRetryDelaysMs[attemptIndex]
-            if delayMs > 0 {
-                try? await Task.sleep(for: .milliseconds(delayMs))
-                guard !Task.isCancelled,
-                      isCurrentControlIntent(generation, for: lamp, field: field) else { return }
-            }
-
-            let deliveryIntent = attemptIndex == 0
-                ? intent
-                : intent.reissuedForTransportRetry(UInt8(attemptIndex))
-
-            if attemptIndex > 0 {
-                // Keep optimistic UI ownership alive while the newest command
-                // is actively recovering. Matching authoritative ACK/state
-                // clears these holds immediately; a newer user intent cancels
-                // this recovery through the generation guard above.
-                refreshPendingHoldForRetry(lamp, intent: deliveryIntent)
-                print("RF5.4.3 CMD retry id=\(deliveryIntent.commandID) baseSeq=\(intent.intentSequence) attempt=\(attemptIndex)")
-            }
-
-            do {
-                try await performOrderedRoutedSingleAttempt(
-                    lamp: lamp,
-                    intent: deliveryIntent,
-                    generation: generation,
-                    field: field
-                )
-                return
-            } catch {
-                lastError = error
-                guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
-                guard shouldRetryOrderedDelivery(after: error) else { throw error }
-            }
-        }
-
-        throw lastError ?? AppError.message("No available connection could control this lamp.")
+        // RF6.0 local control makes one logical delivery attempt. BLE/LAN may
+        // hedge the same command ID inside the single attempt, but local R1/R2
+        // transport retries are removed. Fresh-ID recovery belongs only to the
+        // Remote Cloud plane.
+        guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
+        try await performOrderedRoutedSingleAttempt(
+            lamp: lamp,
+            intent: intent,
+            generation: generation,
+            field: field
+        )
     }
 
     private func performOrderedRoutedSingleAttempt(
@@ -1246,27 +1343,8 @@ final class AppViewModel: ObservableObject {
             }
         }
 
-        // Cloud is a second-stage fallback only. If LAN/BLE is working, this
-        // branch is never entered and Cloud cannot interfere with local control
-        // or the displayed route.
+        // RF6.0: Cloud is not a Devices fallback. A local failure ends here.
         guard isCurrentControlIntent(generation, for: lamp, field: field) else { return }
-        if orderedRoutes.contains(.cloud) {
-            let liveLamp = freshestLampRecord(for: lamp)
-            if routeCanBeAttempted(.cloud, lamp: liveLamp) {
-                do {
-                    let route = try await attemptOrderedRoute(.cloud, lamp: lamp, intent: intent)
-                    print("RF5.4.3-R3.3 CMD app_done id=\(intent.commandID) route=\(route.rawValue) total=\(Int(Date().timeIntervalSince(commandStartedAt) * 1000))ms")
-                    updateLocalRecord(for: lamp) { record in
-                        record.route = route
-                        record.online = true
-                    }
-                    return
-                } catch {
-                    lastFailure = error.localizedDescription
-                }
-            }
-        }
-
         throw AppError.message(lastFailure)
     }
 
@@ -1317,25 +1395,17 @@ final class AppViewModel: ObservableObject {
     }
 
     private func routeOrder(for lamp: LampRecord) -> [LampConnectionRoute] {
+        // RF6.0: Devices never route through Cloud.
         let base: [LampConnectionRoute]
         switch lamp.routePreference {
-        case .remote:
-            // Strict Remote preference remains Cloud-only by user choice.
-            return [.cloud]
-        case .bluetooth:
-            base = [.bluetooth, .wifi, .cloud]
         case .wifi:
-            base = [.wifi, .bluetooth, .cloud]
-        case .automatic:
-            // Production priority is semantic-health BLE > LAN > Cloud. RSSI is
-            // diagnostic information, not a reason to abandon an ACK-healthy
-            // BLE path. Circuit-breaker failures below can still demote it.
-            base = [.bluetooth, .wifi, .cloud]
+            base = [.wifi, .bluetooth]
+        case .bluetooth:
+            base = [.bluetooth, .wifi]
+        case .remote, .automatic:
+            base = [.bluetooth, .wifi]
         }
 
-        // A route that has missed two semantic ACKs is moved behind healthy
-        // alternatives for a short probe window, rather than forcing every new
-        // command to pay the same timeout. It is not permanently disabled.
         let now = Date()
         let healthy = base.filter { !isRouteCircuitOpen($0, lamp: lamp, now: now) }
         let degraded = base.filter { isRouteCircuitOpen($0, lamp: lamp, now: now) }
@@ -2186,7 +2256,6 @@ final class AppViewModel: ObservableObject {
             optimisticStateAt[lamps[index].id.uppercased()] = now
             optimisticStateAt[lamps[index].canonicalID.uppercased()] = now
         }
-        if let index = dashboard.lamps.firstIndex(where: { $0.id == lampID }) { change(&dashboard.lamps[index]) }
         if var local = localRecords[lampID] { change(&local); localRecords[lampID] = local }
     }
 
@@ -2200,6 +2269,7 @@ final class AppViewModel: ObservableObject {
         let receivedAt = Date()
         let stateObservedAt = authoritative ? receivedAt : observedAt
         localSnapshots[localID] = snapshot
+        remoteAccessByPhysicalID[localID] = snapshot.remoteAccessEnabled
         rememberedBrightnessByLamp[localID] = max(1, min(100, snapshot.lastBrightness))
         local.startRealtime(host: snapshot.host, expectedLampID: snapshot.lampId)
         if confirmsWiFiCommandPath {
@@ -2239,6 +2309,7 @@ final class AppViewModel: ObservableObject {
         record.wifiRSSI = snapshot.rssi
         record.bleName = snapshot.bleName.isEmpty ? record.bleName : snapshot.bleName
         record.controllerCount = snapshot.controllerCount
+        record.remoteAccessEnabled = snapshot.remoteAccessEnabled
         let currentState = lamps.first(where: { $0.canonicalID == record.canonicalID })?.state ?? record.state
         var incomingState = LampState(
             power: snapshot.power,
@@ -2279,9 +2350,7 @@ final class AppViewModel: ObservableObject {
         if stateAccepted && timerAccepted {
             scheduleTimerNotification(for: record, remainingSeconds: snapshot.timerRemainingSeconds)
         }
-        record.route = selectedRoute(for: record, local: record, cloud: record.cloudLampId.flatMap { cloudID in
-            dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
-        })
+        record.route = selectedRoute(for: record, local: record, cloud: nil)
         if key != localID { localRecords.removeValue(forKey: key) }
         localRecords[localID] = record
         let metadataChanged = key != localID ||
@@ -2297,55 +2366,47 @@ final class AppViewModel: ObservableObject {
     }
 
     private func rebuildLamps() {
+        // RF6.0: Devices is strictly local. Cloud dashboard records are never
+        // merged into this array and therefore cannot make a local lamp Online,
+        // Offline, or change its displayed route.
         var normalizedLocal: [String: LampRecord] = [:]
         for var localRecord in localRecords.values {
-            let localKey = (localRecord.physicalLocalIDNormalized ?? localRecord.id.uppercased())
+            let localKey = localRecord.physicalLocalIDNormalized ?? localRecord.id.uppercased()
             localRecord.id = localKey
             localRecord.physicalLocalID = localKey
             localRecord.cloudClaimed = localRecord.cloudLampId.map { cloudID in
                 dashboard.lamps.contains { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame }
             } ?? false
+            localRecord.route = selectedRoute(for: localRecord, local: localRecord, cloud: nil)
+            localRecord.online = localRecord.route != .offline
             if var existing = normalizedLocal[localKey] {
                 existing = mergeRecords(existing, localRecord)
+                existing.route = selectedRoute(for: existing, local: existing, cloud: nil)
+                existing.online = existing.route != .offline
                 normalizedLocal[localKey] = existing
             } else {
                 normalizedLocal[localKey] = localRecord
             }
         }
         localRecords = normalizedLocal
-
-        var cloudByID: [String: LampRecord] = [:]
-        for var cloud in dashboard.lamps {
-            let cloudID = cloud.id.uppercased()
-            cloud.id = cloudID
-            cloud.physicalLocalID = nil
-            cloud.cloudLampId = cloudID
-            cloud.cloudClaimed = true
-            cloud.route = cloud.online ? .cloud : .offline
-            cloudByID[cloudID] = cloud
-        }
-
-        var result: [String: LampRecord] = cloudByID
-        for local in localRecords.values {
-            let cloudKey = local.cloudLampId?.uppercased()
-            let destinationKey = cloudKey ?? local.id.uppercased()
-            if var combined = cloudKey.flatMap({ result[$0] }) ?? result[local.id.uppercased()] {
-                combined = mergeRecords(combined, local)
-                combined.route = selectedRoute(for: combined, local: local, cloud: cloudKey.flatMap { cloudByID[$0] })
-                combined.online = combined.route != .offline
-                result[destinationKey] = combined
-                if destinationKey != local.id.uppercased() { result.removeValue(forKey: local.id.uppercased()) }
-            } else {
-                var onlyLocal = local
-                onlyLocal.route = selectedRoute(for: onlyLocal, local: local, cloud: nil)
-                onlyLocal.online = onlyLocal.route != .offline
-                result[destinationKey] = onlyLocal
-            }
-        }
-
-        lamps = result.values
+        lamps = normalizedLocal.values
             .filter { !transientLocalIDs.contains($0.id.uppercased()) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        // Remote is a Cloud-only projection. It has its own state/health and is
+        // intentionally not merged with the local Devices records.
+        remoteLamps = dashboard.lamps.map { cloud in
+            var remote = cloud
+            let cloudID = cloud.id.uppercased()
+            remote.id = cloudID
+            remote.physicalLocalID = nil
+            remote.cloudLampId = cloudID
+            remote.cloudClaimed = true
+            remote.route = cloud.online ? .cloud : .offline
+            remote.online = cloud.online
+            return remote
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     private func mergeRecords(_ primary: LampRecord, _ local: LampRecord) -> LampRecord {
@@ -2366,13 +2427,13 @@ final class AppViewModel: ObservableObject {
         merged.firmware = local.firmware ?? merged.firmware
         merged.controllerCount = max(local.controllerCount, merged.controllerCount)
         let localKeys = [local.physicalLocalIDNormalized, local.id.uppercased(), local.cloudIDNormalized].compactMap { $0 }
-        let cloudKeys = [primary.id.uppercased(), primary.cloudLampId?.uppercased()].compactMap { $0 }
         let localFullStateAt = localKeys.compactMap { key in
             [localStateReceivedAt[key], bleStateReceivedAt[key]].compactMap { $0 }.max()
         }.max()
-        let cloudAt = cloudKeys.compactMap { cloudStateReceivedAt[$0] }.max()
-        let optimisticAt = (localKeys + cloudKeys).compactMap { optimisticStateAt[$0] }.max()
-        let primaryFreshness = [cloudAt, optimisticAt].compactMap { $0 }.max()
+        // RF6.0 local merge is intentionally blind to Cloud receipt time.
+        // Cloud timestamps can never block a newer BLE/LAN physical state.
+        let optimisticAt = localKeys.compactMap { optimisticStateAt[$0] }.max()
+        let primaryFreshness = optimisticAt
 
         // The newest confirmed/optimistic full state wins. Route preference is
         // used for command transport, not for deciding whether an older state
@@ -2428,37 +2489,28 @@ final class AppViewModel: ObservableObject {
     }
 
     private func selectedRoute(for lamp: LampRecord, local: LampRecord?, cloud: LampRecord?) -> LampConnectionRoute {
-        let hasWiFi = local.map { isWiFiHealthy($0) } ?? false
+        // RF6.0 Devices route selection is local-only. Cloud health is not an
+        // input to this function, even though the linked Cloud ID is retained
+        // as metadata for the Remote tab.
+        let physicalKey = lamp.physicalLocalIDNormalized ?? lamp.id.uppercased()
+        let remoteMode = remoteAccessByPhysicalID[physicalKey] ?? lamp.remoteAccessEnabled
+        let hasWiFi = !remoteMode && (local.map { isWiFiHealthy($0) } ?? false)
         let hasBLE = local.map(canUseBLE) ?? false
-        // RF5.2: Remote remains usable through the semantic-ACK REST fallback
-        // while the app realtime WebSocket is rebinding.
-        let hasCloud = isCloudHealthy(lamp)
 
         switch lamp.routePreference {
-        case .remote:
-            return hasCloud ? .cloud : .offline
-        case .bluetooth:
-            if hasBLE { return .bluetooth }
-            // A manual Bluetooth preference still falls back locally before
-            // going remote, matching routeOrder() and the user's expected
-            // BLE -> LAN -> Cloud behavior.
-            if hasWiFi { return .wifi }
-            if hasCloud { return .cloud }
         case .wifi:
             if hasWiFi { return .wifi }
             if hasBLE { return .bluetooth }
-            if hasCloud { return .cloud }
-        case .automatic:
-            let healthLamp = local ?? lamp
-            if hasBLE && !isRouteCircuitOpen(.bluetooth, lamp: healthLamp) { return .bluetooth }
-            if hasWiFi && !isRouteCircuitOpen(.wifi, lamp: healthLamp) { return .wifi }
-            if hasCloud && !isRouteCircuitOpen(.cloud, lamp: lamp) { return .cloud }
-            // Never manufacture an Offline gap merely because a route is in a
-            // short circuit-breaker cooldown. Keep the best connected fallback
-            // visible while its health probe recovers.
+        case .bluetooth:
             if hasBLE { return .bluetooth }
             if hasWiFi { return .wifi }
-            if hasCloud { return .cloud }
+        case .remote, .automatic:
+            // Legacy `.remote` preference is treated as automatic locally in
+            // RF6; Remote is now a separate tab rather than a Devices route.
+            if hasBLE && !isRouteCircuitOpen(.bluetooth, lamp: lamp) { return .bluetooth }
+            if hasWiFi && !isRouteCircuitOpen(.wifi, lamp: lamp) { return .wifi }
+            if hasBLE { return .bluetooth }
+            if hasWiFi { return .wifi }
         }
         return .offline
     }
@@ -2486,7 +2538,7 @@ final class AppViewModel: ObservableObject {
             lamp.routePreference = existing.routePreference
         }
 
-        let currentState = lamps.first(where: { $0.canonicalID == lamp.canonicalID })?.state
+        let currentState = remoteLamps.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })?.state
             ?? existingDashboard?.state
             ?? lamp.state
         let reportedTimer = lamp.state.timerRemainingSeconds
@@ -2499,9 +2551,20 @@ final class AppViewModel: ObservableObject {
             timerAccepted = registerTimerState(for: lamp, remainingSeconds: reportedTimer, receivedAt: receivedAt)
             if !timerAccepted { lamp.state.timerRemainingSeconds = currentState.timerRemainingSeconds }
             lamp.state = protectedIncomingState(lamp.state, for: lamp, current: currentState)
-            optimisticStateAt.removeValue(forKey: id)
         } else {
             lamp.state = currentState
+        }
+
+        if let pending = remotePendingOutput[id], pending.expiresAt > receivedAt {
+            if lamp.state.power == pending.power && lamp.state.brightness == pending.brightness {
+                remotePendingOutput.removeValue(forKey: id)
+            } else {
+                lamp.state.power = pending.power
+                lamp.state.brightness = pending.brightness
+                if pending.brightness > 0 { lamp.state.rememberedBrightness = pending.brightness }
+            }
+        } else {
+            remotePendingOutput.removeValue(forKey: id)
         }
 
         if lamp.state.rememberedBrightness > 0 {
@@ -2811,6 +2874,25 @@ extension AppViewModel: BLELampManagerDelegate {
         rebuildLamps()
     }
 
+    func bleManager(_ manager: BLELampManager, didReceiveRemoteAccess enabled: Bool) {
+        let key = connectedLocalID.uppercased()
+        guard !key.isEmpty else { return }
+        remoteAccessByPhysicalID[key] = enabled
+        if var record = localRecords[key] {
+            record.remoteAccessEnabled = enabled
+            localRecords[key] = record
+            persistLocalRecords()
+            rebuildLamps()
+        }
+        if let host = localRecords[key]?.localHost {
+            Task {
+                if let snapshot = try? await local.readStatus(host: host) {
+                    apply(snapshot: snapshot, authoritative: true)
+                }
+            }
+        }
+    }
+
     func bleManager(_ manager: BLELampManager, didUpdateRSSI rssi: Int, lampID: String) {
         let key = (lampID.isEmpty ? connectedLocalID : lampID).uppercased()
         guard !key.isEmpty else { return }
@@ -2831,9 +2913,7 @@ extension AppViewModel: BLELampManagerDelegate {
             connectedLocalID = ""
             for key in Array(localRecords.keys) {
                 guard var record = localRecords[key], record.route == .bluetooth else { continue }
-                record.route = selectedRoute(for: record, local: record, cloud: record.cloudLampId.flatMap { cloudID in
-                    dashboard.lamps.first(where: { $0.id.caseInsensitiveCompare(cloudID) == .orderedSame })
-                })
+                record.route = selectedRoute(for: record, local: record, cloud: nil)
                 record.online = record.route != .offline
                 localRecords[key] = record
             }

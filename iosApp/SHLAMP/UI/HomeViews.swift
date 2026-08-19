@@ -14,18 +14,22 @@ struct MainTabView: View {
                 .tabItem { Label("Devices", systemImage: "lightbulb.2") }
                 .tag(1)
 
+            NavigationStack { RemoteView() }
+                .tabItem { Label("Remote", systemImage: "cloud") }
+                .tag(2)
+
             NavigationStack { CareView() }
                 .tabItem { Label("Care", systemImage: "heart.text.square") }
-                .tag(2)
+                .tag(3)
 
             NavigationStack {
                 MenuView(
                     openDevices: { selectedTab = 1 },
-                    openCare: { selectedTab = 2 }
+                    openCare: { selectedTab = 3 }
                 )
             }
             .tabItem { Label("Menu", systemImage: "line.3.horizontal") }
-            .tag(3)
+            .tag(4)
         }
         .tint(SHLampTheme.primary)
         .toolbarBackground(.visible, for: .tabBar)
@@ -107,7 +111,7 @@ struct HomeView: View {
         if model.lamps.isEmpty { return "Set up your first lamp" }
         if reachable == model.lamps.count { return "All lamps are ready" }
         if reachable > 0 { return "\(reachable) of \(model.lamps.count) lamps ready" }
-        return model.cloudConnected ? "Remote connection is available" : model.cloudStatus
+        return "No local lamp is currently reachable"
     }
 
     private var homeHero: some View {
@@ -117,7 +121,7 @@ struct HomeView: View {
                     Text("Your lighting at a glance")
                         .font(.title3.bold())
                         .foregroundStyle(SHLampTheme.textPrimary)
-                    Text(model.cloudConnected ? "Cloud and local controls are active" : model.cloudStatus)
+                    Text("Local Devices and Remote Cloud are independent")
                         .font(.caption)
                         .foregroundStyle(SHLampTheme.textSecondary)
                 }
@@ -324,13 +328,137 @@ struct DevicesView: View {
     }
 }
 
+
+struct RemoteView: View {
+    @EnvironmentObject private var model: AppViewModel
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            LazyVStack(spacing: 14) {
+                AppTopHeader(
+                    title: "Remote",
+                    subtitle: "Optional Cloud control, separate from local Devices",
+                    loading: model.busy,
+                    onSearch: nil,
+                    onRefresh: model.refresh,
+                    onAdd: nil
+                )
+
+                InfoPanel(
+                    title: "Local and Remote are independent",
+                    text: "Bluetooth remains available in both modes. Wi-Fi stays connected to the router. Remote Access OFF enables LAN control and stops the ESP Cloud socket; Remote Access ON disables LAN mutations and enables Cloud.",
+                    accent: SHLampTheme.info,
+                    surface: SHLampTheme.infoSoft
+                )
+
+                if model.remoteLamps.isEmpty {
+                    InfoPanel(
+                        title: "No Remote lamps",
+                        text: model.isSignedIn ? "Cloud-linked lamps will appear here." : "Sign in to use Remote control.",
+                        accent: SHLampTheme.textSecondary,
+                        surface: SHLampTheme.surfaceSoft
+                    )
+                } else {
+                    ForEach(model.remoteLamps) { lamp in
+                        RemoteLampCard(lamp: lamp)
+                    }
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 14)
+            .padding(.bottom, 28)
+        }
+        .background(SHLampTheme.background.ignoresSafeArea())
+    }
+}
+
+private struct RemoteLampCard: View {
+    @EnvironmentObject private var model: AppViewModel
+    let lamp: LampRecord
+
+    @State private var draftBrightness: Double = 0
+    @State private var sliderActive = false
+
+    private var localLamp: LampRecord? { model.localLamp(forRemote: lamp) }
+    private var remoteEnabled: Bool {
+        guard let localLamp else { return false }
+        return model.remoteAccessEnabled(for: localLamp)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(lamp.name).font(.headline)
+                    Text(lamp.online ? "Remote Connected" : (remoteEnabled ? "Remote Offline" : "Remote Access Off"))
+                        .font(.caption)
+                        .foregroundStyle(lamp.online ? SHLampTheme.success : SHLampTheme.textSecondary)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { remoteEnabled },
+                    set: { enabled in
+                        if let localLamp { model.setRemoteAccess(localLamp, enabled: enabled) }
+                    }
+                ))
+                .labelsHidden()
+                .disabled(localLamp == nil)
+            }
+
+            if localLamp == nil {
+                Text("Connect to the physical lamp locally once to manage its Remote Access toggle.")
+                    .font(.caption)
+                    .foregroundStyle(SHLampTheme.textSecondary)
+            }
+
+            HStack(spacing: 14) {
+                Button {
+                    model.setRemotePower(lamp, on: !lamp.state.power)
+                } label: {
+                    Label(lamp.state.power ? "Turn Off" : "Turn On", systemImage: "power")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!lamp.online || !remoteEnabled)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Brightness").font(.caption.weight(.semibold))
+                    Spacer()
+                    Text("\(Int(sliderActive ? draftBrightness : Double(lamp.state.brightness)))%")
+                        .font(.caption.monospacedDigit())
+                }
+                Slider(
+                    value: Binding(
+                        get: { sliderActive ? draftBrightness : Double(lamp.state.brightness) },
+                        set: { draftBrightness = $0 }
+                    ),
+                    in: 0...100,
+                    step: 1,
+                    onEditingChanged: { editing in
+                        sliderActive = editing
+                        if editing {
+                            draftBrightness = Double(lamp.state.brightness)
+                        } else {
+                            model.setRemoteBrightness(lamp, value: Int(draftBrightness.rounded()))
+                        }
+                    }
+                )
+                .disabled(!lamp.online || !remoteEnabled)
+            }
+        }
+        .shCard(padding: 16, radius: 22)
+    }
+}
+
 struct CareView: View {
     @EnvironmentObject private var model: AppViewModel
 
     private var online: Int { model.lamps.filter(\.reachable).count }
     private var offline: Int { model.lamps.count - online }
     private var linked: Int { model.lamps.filter(\.cloudClaimed).count }
-    private var needsAttention: Bool { offline > 0 || (!model.cloudConnected && linked > 0) }
+    private var needsAttention: Bool { offline > 0 }
 
     var body: some View {
         ScrollView(showsIndicators: false) {

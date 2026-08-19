@@ -184,6 +184,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
     var id: String
     var cloudLampId: String?
     var cloudClaimed = false
+    var remoteAccessEnabled = false
     var homeId: String
     var roomId: String?
     var roomName: String?
@@ -204,7 +205,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
     var state: LampState
 
     private enum CodingKeys: String, CodingKey {
-        case physicalLocalID, id, cloudLampId, cloudClaimed, homeId, roomId, roomName, name, model
+        case physicalLocalID, id, cloudLampId, cloudClaimed, remoteAccessEnabled, homeId, roomId, roomName, name, model
         case firmware, online, lastSeen, route, routePreference, bleIdentifier, bleName
         case localHost, wifiSSID, wifiRSSI, bleRSSI, controllerCount, state
     }
@@ -214,6 +215,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
         physicalLocalID: String? = nil,
         cloudLampId: String? = nil,
         cloudClaimed: Bool = false,
+        remoteAccessEnabled: Bool = false,
         homeId: String,
         roomId: String? = nil,
         roomName: String? = nil,
@@ -237,6 +239,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
         self.id = id
         self.cloudLampId = cloudLampId
         self.cloudClaimed = cloudClaimed
+        self.remoteAccessEnabled = remoteAccessEnabled
         self.homeId = homeId
         self.roomId = roomId
         self.roomName = roomName
@@ -263,6 +266,7 @@ struct LampRecord: Identifiable, Codable, Equatable {
         id = try values.decode(String.self, forKey: .id)
         cloudLampId = try values.decodeIfPresent(String.self, forKey: .cloudLampId)
         cloudClaimed = try values.decodeIfPresent(Bool.self, forKey: .cloudClaimed) ?? false
+        remoteAccessEnabled = try values.decodeIfPresent(Bool.self, forKey: .remoteAccessEnabled) ?? false
         homeId = try values.decodeIfPresent(String.self, forKey: .homeId) ?? "default"
         roomId = try values.decodeIfPresent(String.self, forKey: .roomId)
         roomName = try values.decodeIfPresent(String.self, forKey: .roomName)
@@ -405,6 +409,8 @@ struct WiFiLampSnapshot: Equatable {
     let powerMode: LampPowerMode
     let runtimeState: LampRuntimeState
     let host: String
+    var ipControlMode: String = "LOCAL"
+    var remoteAccessEnabled: Bool = false
     var stateBootId: Int64? = nil
     var stateBootSequence: Int64? = nil
     var stateRevision: Int64? = nil

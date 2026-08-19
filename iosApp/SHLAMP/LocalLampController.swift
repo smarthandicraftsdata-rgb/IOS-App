@@ -422,7 +422,7 @@ final class LocalLampController: NSObject {
         request.timeoutInterval = 1.0
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.8.5-RF5.4.3-R3.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/2.0.0-RF6.0", forHTTPHeaderField: "User-Agent")
         request.httpBody = try jsonData(orderedObject(intent))
         let (data, response) = try await controlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -683,6 +683,16 @@ final class LocalLampController: NSObject {
         }
     }
 
+    func setIPControlMode(host: String, expectedLampID: String, remote: Bool) async throws -> WiFiLampSnapshot {
+        _ = try await verifyPhysicalIdentity(host: host, expectedLampID: expectedLampID)
+        let mode = remote ? "REMOTE" : "LOCAL"
+        _ = try await request(host: host, path: "/api/ip-mode?mode=\(mode)")
+        return try await verified(host: host, path: "/api/status") { snapshot in
+            snapshot.lampId.caseInsensitiveCompare(expectedLampID) == .orderedSame &&
+            snapshot.remoteAccessEnabled == remote
+        }
+    }
+
     func sendFade(host: String, mode: Int) async throws -> WiFiLampSnapshot {
         let value = clamp(mode, 0...3)
         return try await verified(host: host, path: "/api/fade?mode=\(value)") { $0.fadeMode == value }
@@ -752,7 +762,7 @@ final class LocalLampController: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.15
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("SHLAMP-iOS/1.8.5-RF5.4.3-R3.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("SHLAMP-iOS/2.0.0-RF6.0", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await controlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? ""
@@ -800,6 +810,8 @@ final class LocalLampController: NSObject {
             runtimeState: LampRuntimeState(rawValue: json.string("runtimeState").uppercased()) ?? .unknown,
             host: host
         )
+        snapshot.ipControlMode = firstNonBlank(json.string("ipControlMode"), "LOCAL").uppercased()
+        snapshot.remoteAccessEnabled = json.bool("remoteAccessEnabled") ?? (snapshot.ipControlMode == "REMOTE")
         snapshot.stateBootId = json.int("bootId", "stateBootId").map { Int64($0) }
         snapshot.stateBootSequence = json.int("bootSequence", "stateBootSequence").map { Int64($0) }
         snapshot.stateRevision = json.int("stateRevision", "revision").map { Int64($0) }

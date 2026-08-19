@@ -13,6 +13,7 @@ protocol BLELampManagerDelegate: AnyObject {
     func bleManager(_ manager: BLELampManager, didReceiveBattery percent: Int, lampID: String)
     func bleManager(_ manager: BLELampManager, didReceiveWiFiStatus status: String)
     func bleManager(_ manager: BLELampManager, didReceivePowerMode mode: LampPowerMode)
+    func bleManager(_ manager: BLELampManager, didReceiveRemoteAccess enabled: Bool)
     func bleManager(_ manager: BLELampManager, didUpdateRSSI rssi: Int, lampID: String)
     func bleManager(_ manager: BLELampManager, bluetoothPoweredOn: Bool)
     func bleManager(_ manager: BLELampManager, didReceiveSavedNetworks networks: [SavedWiFiNetwork])
@@ -319,6 +320,7 @@ final class BLELampManager: NSObject {
         writeControl([0x06])
     }
     func powerMode(_ mode: LampPowerMode) { writeControl([0x08, mode.binaryValue]) }
+    func remoteAccess(_ enabled: Bool) { writeControl([0x09, enabled ? 0x01 : 0x00]) }
     func requestWiFiStatus() { writeWiFi([0x21]) }
     func retryWiFi() { writeWiFi([0x22]) }
     func requestSavedWiFiNetworks() { writeWiFi([0x25]) }
@@ -539,6 +541,8 @@ final class BLELampManager: NSObject {
                 } else if text.hasPrefix("M:"),
                           let mode = LampPowerMode(rawValue: String(text.dropFirst(2)).uppercased()) {
                     Task { @MainActor in delegate?.bleManager(self, didReceivePowerMode: mode) }
+                } else if text == "R:ON" || text == "R:OFF" {
+                    Task { @MainActor in delegate?.bleManager(self, didReceiveRemoteAccess: text == "R:ON") }
                 }
             }
         }
